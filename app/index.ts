@@ -359,6 +359,7 @@ function openVpnArgs(tunnel: TunnelInfo): string[] {
 		"ignore",
 		"redirect-gateway",
 		"--route-nopull",
+		"--route-noexec",
 		"--verb",
 		"3",
 	];
