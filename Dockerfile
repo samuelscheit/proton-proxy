@@ -47,6 +47,7 @@ COPY tundialer-native /tundialer-native
 COPY app/package.json app/package-lock.json /app/
 WORKDIR /app
 RUN npm ci \
+    && npm run check \
     && npx patchright install chrome
 
 COPY app /app
