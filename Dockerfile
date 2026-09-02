@@ -47,7 +47,6 @@ COPY tundialer-native /tundialer-native
 COPY app/package.json app/package-lock.json /app/
 WORKDIR /app
 RUN npm ci \
-    && npm run check \
     && npx patchright install chrome
 
 COPY app /app
@@ -55,7 +54,8 @@ COPY app /app
 # OpenVPN profiles and credentials are runtime inputs. Mount profiles at
 # /etc/openvpn/configs instead of baking private .ovpn material into an image.
 RUN mkdir -p /etc/openvpn/configs \
-    && chmod 0755 /app/start.sh
+    && chmod 0755 /app/start.sh \
+    && npm run check
 
 ENV DBUS_SESSION_BUS_ADDRESS=autolaunch:
 
