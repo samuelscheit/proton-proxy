@@ -302,8 +302,20 @@ function runIp(arguments_: string[], description: string, allowFailure = false):
 }
 
 function clearTunnelRoute(tunnel: TunnelInfo): void {
-	runIp(["-4", "rule", "del", "priority", String(tunnel.routingRulePriority)], `remove ${tunnel.devName} policy rule`, true);
-	runIp(["-4", "route", "flush", "table", String(tunnel.routingTable)], `clear ${tunnel.devName} route table`, true);
+	const table = String(tunnel.routingTable);
+	const mark = `0x${tunnel.routingMark.toString(16)}/0xffffffff`;
+	// Match every selector we installed. Deleting by priority alone could
+	// remove an unrelated host policy rule when an operator accidentally
+	// chooses a colliding base range.
+	runIp(
+		["-4", "rule", "del", "priority", String(tunnel.routingRulePriority), "fwmark", mark, "lookup", table],
+		`remove ${tunnel.devName} policy rule`,
+		true,
+	);
+	// Do not flush the whole numeric table: it might be an operator's table if
+	// they configured a conflicting base. The route created below is the only
+	// route this service owns.
+	runIp(["-4", "route", "del", "default", "dev", tunnel.devName, "table", table], `remove ${tunnel.devName} default route`, true);
 }
 
 function configureTunnelRoute(tunnel: TunnelInfo): void {
