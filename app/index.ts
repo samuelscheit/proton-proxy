@@ -450,11 +450,26 @@ function startOpenVpn(tunnel: TunnelInfo): OpenVpnRun {
 			}
 		}
 	};
+	const flushPartialLines = () => {
+		if (stdoutRemainder) {
+			const partial = stdoutRemainder;
+			stdoutRemainder = "";
+			consume(Buffer.from(`${partial}\n`), "stdout");
+		}
+		if (stderrRemainder) {
+			const partial = stderrRemainder;
+			stderrRemainder = "";
+			consume(Buffer.from(`${partial}\n`), "stderr");
+		}
+	};
 
 	child.stdout?.on("data", (data: Buffer) => consume(data, "stdout"));
 	child.stderr?.on("data", (data: Buffer) => consume(data, "stderr"));
 	child.once("error", (error) => finish(null, null, error));
-	child.once("exit", (code, signal) => finish(code, signal));
+	child.once("exit", (code, signal) => {
+		flushPartialLines();
+		finish(code, signal);
+	});
 	console.log(`[openvpn] launched ${tunnel.configName} on ${tunnel.devName}`);
 	return { child, ready, exited };
 }

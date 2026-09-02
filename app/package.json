@@ -7,7 +7,7 @@
   "scripts": {
     "check": "tsc --noEmit",
     "start": "node ./index.ts",
-    "preinstall": "cd ../tundialer-native && npm install"
+    "preinstall": "cd ../tundialer-native && npm ci"
   },
   "dependencies": {
     "dotenv": "^17.2.1",
