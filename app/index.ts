@@ -721,10 +721,11 @@ async function main(): Promise<void> {
 
 	const tunnels = buildTunnels(await listConfigs());
 	signalTunnels = tunnels;
-	await createRotatingProxy(tunnels);
-	await Promise.all(tunnels.map(createTunnelProxy));
-	const workers = tunnels.map((tunnel) => superviseTunnel(tunnel));
+	let workers: Promise<void>[] = [];
 	try {
+		await createRotatingProxy(tunnels);
+		await Promise.all(tunnels.map(createTunnelProxy));
+		workers = tunnels.map((tunnel) => superviseTunnel(tunnel));
 		await waitForReadyTunnel(tunnels);
 		console.log(`[service] ready: ${tunnels.length} concurrent OpenVPN tunnel worker(s), rotating proxy on ${BASE_PORT}`);
 		await Promise.all(workers);
