@@ -1,121 +1,350 @@
-import { spawn, spawnSync } from "child_process";
-import { promises as fs, existsSync, readFileSync } from "fs";
-import path from "path";
-import net from "net";
-import { URL } from "url";
+import { spawn, spawnSync, type ChildProcess } from "child_process";
+import { existsSync, promises as fs, readFileSync } from "fs";
 import dns from "dns";
-import { connectViaDialer } from "./dialer.ts";
-import { resetCredentials } from "./browser.ts";
+import net from "net";
+import path from "path";
+import { URL } from "url";
 
-process.on("uncaughtException", console.error);
-process.on("unhandledRejection", console.error);
+import { resetCredentials, type OpenVpnCredentials } from "./browser.ts";
+import { connectViaDialer } from "./dialer.ts";
+
+/**
+ * A multi-tunnel Proton HTTP CONNECT proxy.
+ *
+ * Every OpenVPN profile receives a stable `tunN` interface, its own route
+ * table, a per-socket fwmark, and an individual HTTP proxy listener. The
+ * listener on BASE_PROXY_PORT rotates only across healthy tunnels. The route
+ * isolation is intentionally per socket; no global default route is ever
+ * changed after startup.
+ */
+
+type TunnelState = "starting" | "ready" | "backoff" | "stopped";
 
 interface TunnelInfo {
-	index: number; // sequential index
-	configPath: string; // absolute path to ovpn
-	configName: string; // basename
-	port: number; // local proxy listening port
-	devName: string; // tun device name (tun0, tun1,...)
-	interfaceIp?: string; // assigned IPv4 of tun device
+	configPath: string;
+	configName: string;
+	port: number;
+	devName: string;
+	routingTable: number;
+	routingMark: number;
+	routingRulePriority: number;
+	state: TunnelState;
+	interfaceIp?: string;
+	process?: ChildProcess;
+}
+
+interface OpenVpnExit {
+	code: number | null;
+	signal: NodeJS.Signals | null;
+	authFailed: boolean;
+	logs: string[];
+}
+
+interface OpenVpnRun {
+	child: ChildProcess;
+	ready: Promise<void>;
+	exited: Promise<OpenVpnExit>;
+}
+
+class OpenVpnError extends Error {
+	readonly authFailed: boolean;
+
+	constructor(message: string, authFailed = false) {
+		super(message);
+		this.name = "OpenVpnError";
+		this.authFailed = authFailed;
+	}
 }
 
 const ENV = process.env;
-const AUTH_FILE_PATH = "/etc/openvpn/auth.txt";
-const OVPN_CONFIG_DIR = "/etc/openvpn/configs";
-const OPENVPN_BASE_LOG_DIR = "/tmp/multi_ovpn_logs";
-const BASE_PORT = intFromEnv("BASE_PROXY_PORT", 8100); // rotating proxy port
-const MAX_CONNECTIONS = intFromEnv("MAX_CONNECTIONS", 0);
-const DNS_SERVERS_OVERRIDE = (ENV.DNS_SERVERS_OVERRIDE || "1.1.1.1,8.8.8.8").trim();
-const START_PORT_GAP = intFromEnv("PORT_GAP", 1); // increment between proxy ports
-const CONNECT_BACKLOG = intFromEnv("PROXY_BACKLOG", 128);
-const REQUIRE_TUN_IP = boolFromEnv("REQUIRE_TUN_IP", true);
+const AUTH_FILE_PATH = ENV.OPENVPN_AUTH_FILE || "/etc/openvpn/auth.txt";
+const OVPN_CONFIG_DIR = ENV.OVPN_CONFIG_DIR || "/etc/openvpn/configs";
+const OPENVPN_BIN = ENV.OPENVPN_BIN || "openvpn";
+const BASE_PORT = integerFromEnv("BASE_PROXY_PORT", 8100);
+const MAX_CONNECTIONS = integerFromEnv("MAX_CONNECTIONS", 0);
+const PORT_GAP = integerFromEnv("PORT_GAP", 1);
+const CONNECT_BACKLOG = integerFromEnv("PROXY_BACKLOG", 128);
+const CONNECT_TIMEOUT_MS = integerFromEnv("CONNECT_TIMEOUT_MS", 30_000);
+const TUN_IP_WAIT_MS = integerFromEnv("TUN_IP_WAIT_MS", 30_000);
+const STARTUP_TIMEOUT_MS = integerFromEnv("STARTUP_TIMEOUT_MS", 120_000);
+const RESTART_INITIAL_DELAY_MS = integerFromEnv("RESTART_INITIAL_DELAY_MS", 1_000);
+const RESTART_MAX_DELAY_MS = integerFromEnv("RESTART_MAX_DELAY_MS", 30_000);
+const ROUTING_TABLE_BASE = integerFromEnv("ROUTING_TABLE_BASE", 10_000);
+const ROUTING_MARK_BASE = integerFromEnv("ROUTING_MARK_BASE", 0x5a0000);
+const ROUTING_RULE_PRIORITY_BASE = integerFromEnv("ROUTING_RULE_PRIORITY_BASE", 12_000);
+const REQUIRE_TUN_IP = booleanFromEnv("REQUIRE_TUN_IP", true);
+const RESET_CREDENTIALS_ON_START = booleanFromEnv("RESET_CREDENTIALS_ON_START", false);
+const DNS_SERVERS_OVERRIDE = (ENV.DNS_SERVERS_OVERRIDE || "").trim();
 
-function intFromEnv(name: string, def: number): number {
-	const v = ENV[name];
-	if (!v) return def;
-	const n = parseInt(v, 10);
-	return Number.isFinite(n) ? n : def;
+let stopping = false;
+let resolveShutdown!: () => void;
+const shutdownSignal = new Promise<void>((resolve) => {
+	resolveShutdown = resolve;
+});
+const proxyServers = new Set<net.Server>();
+const activeOpenVpn = new Set<ChildProcess>();
+let credentialRefresh: Promise<void> | undefined;
+
+function integerFromEnv(name: string, fallback: number): number {
+	const raw = ENV[name];
+	if (raw === undefined || raw.trim() === "") return fallback;
+	const parsed = Number(raw.trim());
+	return Number.isSafeInteger(parsed) ? parsed : Number.NaN;
 }
 
-function boolFromEnv(name: string, def: boolean): boolean {
-	const v = (ENV[name] || "").trim().toLowerCase();
-	if (!v) return def;
-	return v === "1" || v === "true" || v === "yes" || v === "on";
+function booleanFromEnv(name: string, fallback: boolean): boolean {
+	const value = (ENV[name] || "").trim().toLowerCase();
+	if (!value) return fallback;
+	return value === "1" || value === "true" || value === "yes" || value === "on";
 }
 
-async function ensureTun(): Promise<void> {
+function sleep(milliseconds: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+async function waitOrShutdown(milliseconds: number): Promise<void> {
+	await Promise.race([sleep(milliseconds), shutdownSignal]);
+}
+
+function validateRuntimeOptions(): void {
+	if (!Number.isInteger(BASE_PORT) || BASE_PORT < 1 || BASE_PORT > 65535) {
+		throw new Error(`BASE_PROXY_PORT must be between 1 and 65535 (received ${BASE_PORT})`);
+	}
+	if (!Number.isInteger(MAX_CONNECTIONS) || MAX_CONNECTIONS < 0) {
+		throw new Error(`MAX_CONNECTIONS must be zero or a positive integer (received ${MAX_CONNECTIONS})`);
+	}
+	if (!Number.isInteger(PORT_GAP) || PORT_GAP < 1) {
+		throw new Error(`PORT_GAP must be a positive integer (received ${PORT_GAP})`);
+	}
+	if (!Number.isInteger(CONNECT_TIMEOUT_MS) || CONNECT_TIMEOUT_MS < 1 || CONNECT_TIMEOUT_MS > 300_000) {
+		throw new Error(`CONNECT_TIMEOUT_MS must be between 1 and 300000 (received ${CONNECT_TIMEOUT_MS})`);
+	}
+	for (const [name, value] of [
+		["PROXY_BACKLOG", CONNECT_BACKLOG],
+		["TUN_IP_WAIT_MS", TUN_IP_WAIT_MS],
+		["STARTUP_TIMEOUT_MS", STARTUP_TIMEOUT_MS],
+		["RESTART_INITIAL_DELAY_MS", RESTART_INITIAL_DELAY_MS],
+		["RESTART_MAX_DELAY_MS", RESTART_MAX_DELAY_MS],
+	] as const) {
+		if (!Number.isSafeInteger(value) || value < 1) {
+			throw new Error(`${name} must be a positive integer (received ${value})`);
+		}
+	}
+	if (RESTART_MAX_DELAY_MS < RESTART_INITIAL_DELAY_MS) {
+		throw new Error("RESTART_MAX_DELAY_MS must be at least RESTART_INITIAL_DELAY_MS");
+	}
+	for (const [name, value] of [
+		["ROUTING_TABLE_BASE", ROUTING_TABLE_BASE],
+		["ROUTING_MARK_BASE", ROUTING_MARK_BASE],
+		["ROUTING_RULE_PRIORITY_BASE", ROUTING_RULE_PRIORITY_BASE],
+	] as const) {
+		if (!Number.isSafeInteger(value) || value < 1 || value > 0xffffffff) {
+			throw new Error(`${name} must be an unsigned positive 32-bit integer (received ${value})`);
+		}
+	}
+}
+
+async function ensureTunDevice(): Promise<void> {
 	if (existsSync("/dev/net/tun")) return;
 	if (!existsSync("/dev/net")) await fs.mkdir("/dev/net", { recursive: true });
-	spawnSync("mknod", ["/dev/net/tun", "c", "10", "200"]);
+	const create = spawnSync("mknod", ["/dev/net/tun", "c", "10", "200"]);
+	if (create.status !== 0 && !existsSync("/dev/net/tun")) {
+		throw new Error("Unable to create /dev/net/tun; pass the device into the container and grant NET_ADMIN");
+	}
 	spawnSync("chmod", ["0666", "/dev/net/tun"]);
-	if (!existsSync("/dev/net/tun")) throw new Error("Cannot create /dev/net/tun");
+	if (!existsSync("/dev/net/tun")) throw new Error("Cannot access /dev/net/tun");
 }
 
-async function ensureAuth(u = ENV.PVPN_USERNAME, p = ENV.PVPN_PASSWORD): Promise<void> {
-	if (existsSync(AUTH_FILE_PATH)) return;
-	if (!u || !p) throw new Error("PVPN_USERNAME/PVPN_PASSWORD required");
-	await fs.writeFile(AUTH_FILE_PATH, `${u}\n${p}\n`, { mode: 0o600 });
+function readAuth(): OpenVpnCredentials {
+	const lines = readFileSync(AUTH_FILE_PATH, "utf8")
+		.split(/\r?\n/)
+		.map((line) => line.trim())
+		.filter(Boolean);
+	if (lines.length < 2) throw new Error(`Invalid OpenVPN credential file: ${AUTH_FILE_PATH}`);
+	return { username: lines[0], password: lines[1] };
+}
+
+async function writeAuth(credentials: OpenVpnCredentials): Promise<void> {
+	if (!credentials.username || !credentials.password) throw new Error("OpenVPN credentials cannot be empty");
+	await fs.mkdir(path.dirname(AUTH_FILE_PATH), { recursive: true });
+	const temporaryPath = `${AUTH_FILE_PATH}.tmp-${process.pid}-${Date.now()}`;
+	try {
+		await fs.writeFile(temporaryPath, `${credentials.username}\n${credentials.password}\n`, { mode: 0o600 });
+		await fs.chmod(temporaryPath, 0o600);
+		await fs.rename(temporaryPath, AUTH_FILE_PATH);
+	} finally {
+		await fs.rm(temporaryPath, { force: true }).catch(() => undefined);
+	}
+}
+
+async function ensureInitialAuth(): Promise<void> {
+	if (RESET_CREDENTIALS_ON_START) {
+		console.log("[auth] resetting Proton OpenVPN credentials on explicit startup request");
+		await writeAuth(await resetCredentials());
+		return;
+	}
+	if (existsSync(AUTH_FILE_PATH)) {
+		readAuth();
+		return;
+	}
+	if (!ENV.PVPN_USERNAME || !ENV.PVPN_PASSWORD) {
+		throw new Error("PVPN_USERNAME and PVPN_PASSWORD are required when no OpenVPN auth file exists");
+	}
+	await writeAuth({ username: ENV.PVPN_USERNAME, password: ENV.PVPN_PASSWORD });
+}
+
+async function refreshCredentialsIfUnchanged(snapshot: OpenVpnCredentials): Promise<void> {
+	const current = readAuth();
+	if (current.username !== snapshot.username || current.password !== snapshot.password) return;
+	if (!credentialRefresh) {
+		credentialRefresh = (async () => {
+			console.warn("[auth] OpenVPN credentials were rejected; performing one account-wide Proton credential reset");
+			await writeAuth(await resetCredentials());
+			// Proton resets a shared OpenVPN credential pair. Deliberately restart
+			// every existing tunnel so they all re-authenticate with the new pair.
+			await Promise.all([...activeOpenVpn].map((child) => stopOpenVpn(child)));
+			console.log("[auth] refreshed credentials and requested a clean restart for all tunnel workers");
+		})().finally(() => {
+			credentialRefresh = undefined;
+		});
+	}
+	await credentialRefresh;
 }
 
 async function listConfigs(): Promise<string[]> {
-	const files = await fs.readdir(OVPN_CONFIG_DIR).catch(() => [] as string[]);
-	const ovpn = files
-		.filter((f) => f.endsWith(".ovpn"))
-		.sort()
-		.map((f) => path.join(OVPN_CONFIG_DIR, f));
-	if (!ovpn.length) throw new Error("No ovpn configs found");
-	return ovpn;
+	const entries = await fs.readdir(OVPN_CONFIG_DIR).catch(() => [] as string[]);
+	const configs = entries
+		.filter((entry) => entry.toLowerCase().endsWith(".ovpn"))
+		.sort((left, right) => left.localeCompare(right))
+		.map((entry) => path.join(OVPN_CONFIG_DIR, entry));
+	if (!configs.length) throw new Error(`No .ovpn configurations found in ${OVPN_CONFIG_DIR}`);
+	return configs;
 }
 
-async function assignPorts(configs: string[]): Promise<TunnelInfo[]> {
-	const out: TunnelInfo[] = [];
-	// Reserve BASE_PORT for the rotating proxy; per-tunnel proxies start after the gap
-	let port = BASE_PORT + START_PORT_GAP;
-	let idx = 0;
-	for (const cfg of configs) {
-		if (MAX_CONNECTIONS && out.length >= MAX_CONNECTIONS) break;
-		const devName = `tun${idx}`;
-		out.push({ index: idx, configPath: cfg, configName: path.basename(cfg), port, devName });
-		port += START_PORT_GAP;
-		idx++;
-	}
-	return out;
+function buildTunnels(configs: string[]): TunnelInfo[] {
+	const selected = MAX_CONNECTIONS === 0 ? configs : configs.slice(0, MAX_CONNECTIONS);
+	if (!selected.length) throw new Error("MAX_CONNECTIONS selected zero OpenVPN profiles");
+	return selected.map((configPath, index) => {
+		const port = BASE_PORT + PORT_GAP * (index + 1);
+		const routingTable = ROUTING_TABLE_BASE + index;
+		const routingMark = ROUTING_MARK_BASE + index;
+		const routingRulePriority = ROUTING_RULE_PRIORITY_BASE + index;
+		if (port > 65535 || routingTable > 0xffffffff || routingMark > 0xffffffff || routingRulePriority > 0xffffffff) {
+			throw new Error("Too many OpenVPN profiles for the configured port or routing identifier ranges");
+		}
+		return {
+			configPath,
+			configName: path.basename(configPath),
+			port,
+			devName: `tun${index}`,
+			routingTable,
+			routingMark,
+			routingRulePriority,
+			state: "starting",
+		};
+	});
 }
 
-async function overrideDNS(): Promise<void> {
+async function overrideDns(): Promise<void> {
 	if (!DNS_SERVERS_OVERRIDE) return;
-	const servers = DNS_SERVERS_OVERRIDE.split(",")
-		.map((s) => s.trim())
-		.filter(Boolean);
+	const servers = DNS_SERVERS_OVERRIDE.split(",").map((server) => server.trim()).filter(Boolean);
 	if (!servers.length) return;
-	await fs.writeFile("/etc/resolv.conf", ["# overridden", ...servers.map((s) => `nameserver ${s}`)].join("\n") + "\n");
+	await fs.writeFile("/etc/resolv.conf", ["# proton-proxy override", ...servers.map((server) => `nameserver ${server}`)].join("\n") + "\n");
 }
 
-function getCurrentAuth(): { username: string; password: string } {
-	const content = readFileSync(AUTH_FILE_PATH, "utf-8");
-	const lines = content
-		.split("\n")
-		.map((l) => l.trim())
-		.filter(Boolean);
-	if (lines.length >= 2) {
-		return { username: lines[0], password: lines[1] };
+function parseIPv4(value: string): string | undefined {
+	return value.match(/\b(?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}\b/)?.[0];
+}
+
+function tunnelIpv4(device: string): string | undefined {
+	try {
+		const result = spawnSync("ip", ["-j", "-4", "address", "show", "dev", device], {
+			encoding: "utf8",
+			stdio: ["ignore", "pipe", "ignore"],
+		});
+		if (result.status === 0 && result.stdout?.trim()) {
+			const interfaces = JSON.parse(result.stdout) as Array<{ addr_info?: Array<{ family?: string; local?: string }> }>;
+			return interfaces.flatMap((entry) => entry.addr_info || []).find((entry) => entry.family === "inet" && entry.local)?.local;
+		}
+	} catch {
+		// Fall through to text parsing for older iproute2 versions.
 	}
-	throw new Error("Invalid auth file format");
+	try {
+		const result = spawnSync("ip", ["-4", "-o", "address", "show", "dev", device], {
+			encoding: "utf8",
+			stdio: ["ignore", "pipe", "ignore"],
+		});
+		return parseIPv4(result.stdout || "");
+	} catch {
+		return undefined;
+	}
 }
 
-function launchOpenVPN(t: TunnelInfo) {
-	const logDir = path.join(OPENVPN_BASE_LOG_DIR, t.configName);
-	fs.mkdir(logDir, { recursive: true });
-	const startAuth = getCurrentAuth();
+async function waitForTunnelIpv4(tunnel: TunnelInfo): Promise<void> {
+	const deadline = Date.now() + TUN_IP_WAIT_MS;
+	while (!stopping) {
+		const address = tunnelIpv4(tunnel.devName) || tunnel.interfaceIp;
+		if (address) {
+			tunnel.interfaceIp = address;
+			return;
+		}
+		if (!tunnel.process || tunnel.process.exitCode !== null || tunnel.process.signalCode !== null || Date.now() >= deadline) break;
+		await waitOrShutdown(250);
+	}
+	if (REQUIRE_TUN_IP) throw new OpenVpnError(`No IPv4 address appeared on ${tunnel.devName}`);
+}
 
-	const args = [
+function runIp(arguments_: string[], description: string, allowFailure = false): void {
+	const result = spawnSync("ip", arguments_, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+	if (result.status === 0 || allowFailure) return;
+	const output = `${result.stdout || ""}\n${result.stderr || ""}`.trim();
+	throw new Error(`${description} failed${output ? `: ${output}` : ""}`);
+}
+
+function clearTunnelRoute(tunnel: TunnelInfo): void {
+	runIp(["-4", "rule", "del", "priority", String(tunnel.routingRulePriority)], `remove ${tunnel.devName} policy rule`, true);
+	runIp(["-4", "route", "flush", "table", String(tunnel.routingTable)], `clear ${tunnel.devName} route table`, true);
+}
+
+function configureTunnelRoute(tunnel: TunnelInfo): void {
+	clearTunnelRoute(tunnel);
+	const route = ["-4", "route", "replace", "default", "dev", tunnel.devName];
+	if (tunnel.interfaceIp) route.push("src", tunnel.interfaceIp);
+	route.push("table", String(tunnel.routingTable));
+	runIp(route, `install ${tunnel.devName} default route`);
+	runIp(
+		[
+			"-4",
+			"rule",
+			"add",
+			"priority",
+			String(tunnel.routingRulePriority),
+			"fwmark",
+			`0x${tunnel.routingMark.toString(16)}/0xffffffff`,
+			"lookup",
+			String(tunnel.routingTable),
+		],
+		`install ${tunnel.devName} policy rule`,
+	);
+	// A marked packet deliberately arrives through a private route table. Strict
+	// rp_filter would discard its reply before userspace sees it.
+	spawnSync("sysctl", ["-q", "-w", `net.ipv4.conf.${tunnel.devName}.rp_filter=0`], { stdio: "ignore" });
+	console.log(`[routing] ${tunnel.devName}: mark=0x${tunnel.routingMark.toString(16)} table=${tunnel.routingTable}`);
+}
+
+function openVpnArgs(tunnel: TunnelInfo): string[] {
+	return [
 		"--config",
-		t.configPath,
+		tunnel.configPath,
 		"--dev",
-		t.devName,
+		tunnel.devName,
+		"--dev-type",
+		"tun",
 		"--auth-user-pass",
 		AUTH_FILE_PATH,
 		"--auth-nocache",
+		"--auth-retry",
+		"nointeract",
 		"--float",
 		"--pull-filter",
 		"ignore",
@@ -130,288 +359,376 @@ function launchOpenVPN(t: TunnelInfo) {
 		"ignore",
 		"redirect-gateway",
 		"--route-nopull",
+		"--verb",
+		"3",
 	];
-	const process = spawn("openvpn", args, { stdio: "pipe" });
+}
 
-	process.on("close", (code, signal) => {
-		console.warn(`[openvpn] ${t.configName} exited with code=${code} signal=${signal}`);
+function startOpenVpn(tunnel: TunnelInfo): OpenVpnRun {
+	const child = spawn(OPENVPN_BIN, openVpnArgs(tunnel), { stdio: ["ignore", "pipe", "pipe"] });
+	tunnel.process = child;
+	activeOpenVpn.add(child);
+
+	let readySettled = false;
+	let exitSettled = false;
+	let authFailed = false;
+	let logs: string[] = [];
+	let stdoutRemainder = "";
+	let stderrRemainder = "";
+	let resolveReady!: () => void;
+	let rejectReady!: (reason: Error) => void;
+	let resolveExited!: (value: OpenVpnExit) => void;
+	const ready = new Promise<void>((resolve, reject) => {
+		resolveReady = resolve;
+		rejectReady = reject;
+	});
+	const exited = new Promise<OpenVpnExit>((resolve) => {
+		resolveExited = resolve;
 	});
 
-	process.on("error", (err) => {
-		console.error(`[openvpn] ${t.configName} error: ${err?.message || err}`);
-	});
+	const finish = (code: number | null, signal: NodeJS.Signals | null, startupError?: Error) => {
+		if (exitSettled) return;
+		exitSettled = true;
+		activeOpenVpn.delete(child);
+		if (tunnel.process === child) tunnel.process = undefined;
+		if (!readySettled) {
+			readySettled = true;
+			rejectReady(
+				startupError || new OpenVpnError(
+					`OpenVPN ${tunnel.configName} exited before initialization (code=${code}, signal=${signal})\n${logs.join("\n")}`,
+					authFailed,
+				),
+			);
+		}
+		resolveExited({ code, signal, authFailed, logs });
+	};
+	const consume = (data: Buffer, source: "stdout" | "stderr") => {
+		const remainder = source === "stdout" ? stdoutRemainder : stderrRemainder;
+		const lines = `${remainder}${data.toString("utf8")}`.split(/\r?\n/);
+		const trailing = lines.pop() || "";
+		if (source === "stdout") stdoutRemainder = trailing;
+		else stderrRemainder = trailing;
+		for (const rawLine of lines) {
+			const line = rawLine.trim();
+			if (!line) continue;
+			logs.push(line);
+			if (logs.length > 200) logs = logs.slice(-200);
+			console.log(`[openvpn:${tunnel.devName}:${source}] ${line}`);
+			if (line.includes("AUTH_FAILED")) authFailed = true;
+			if (line.includes("net_addr_v4_add")) tunnel.interfaceIp = parseIPv4(line) || tunnel.interfaceIp;
+			if (line.includes("Initialization Sequence Completed") && !readySettled) {
+				readySettled = true;
+				resolveReady();
+			}
+		}
+	};
 
-	process.on("closed", () => {
-		console.warn(`[openvpn] ${t.configName} closed`);
-	});
+	child.stdout?.on("data", (data: Buffer) => consume(data, "stdout"));
+	child.stderr?.on("data", (data: Buffer) => consume(data, "stderr"));
+	child.once("error", (error) => finish(null, null, error));
+	child.once("exit", (code, signal) => finish(code, signal));
+	console.log(`[openvpn] launched ${tunnel.configName} on ${tunnel.devName}`);
+	return { child, ready, exited };
+}
 
-	process.on("disconnect", () => {
-		console.warn(`[openvpn] ${t.configName} disconnected`);
-	});
+async function stopOpenVpn(child: ChildProcess): Promise<void> {
+	if (child.exitCode !== null || child.signalCode !== null) return;
+	try {
+		child.kill("SIGTERM");
+	} catch {
+		return;
+	}
+	await Promise.race([new Promise<void>((resolve) => child.once("exit", () => resolve())), sleep(5_000)]);
+	if (child.exitCode === null && child.signalCode === null) {
+		try {
+			child.kill("SIGKILL");
+		} catch {
+			// It can exit between the check and kill.
+		}
+	}
+}
 
-	process.stderr?.on("data", (data) => {
-		const msg = (data || "").toString("utf8").trim();
-		if (msg) console.error(`[openvpn] ${t.configName} stderr: ${msg}`);
-	});
+function tunnelReady(tunnel: TunnelInfo): boolean {
+	return tunnel.state === "ready" && (!REQUIRE_TUN_IP || Boolean(tunnel.interfaceIp));
+}
 
-	console.log(`[openvpn] launched ${t.configName} dev=${t.devName} port=${t.port}`);
+async function superviseTunnel(tunnel: TunnelInfo): Promise<void> {
+	let retryDelay = Math.max(100, RESTART_INITIAL_DELAY_MS);
+	while (!stopping) {
+		tunnel.state = "starting";
+		tunnel.interfaceIp = undefined;
+		const credentialSnapshot = readAuth();
+		let run: OpenVpnRun | undefined;
+		try {
+			run = startOpenVpn(tunnel);
+			await run.ready;
+			await waitForTunnelIpv4(tunnel);
+			configureTunnelRoute(tunnel);
+			if (stopping) break;
+			tunnel.state = "ready";
+			retryDelay = Math.max(100, RESTART_INITIAL_DELAY_MS);
+			console.log(`[tunnel] ready ${tunnel.configName}: ${tunnel.devName} (${tunnel.interfaceIp || "no IPv4"})`);
 
-	return new Promise<TunnelInfo>((resolve, reject) => {
-		let logs = [] as string[];
-
-		process.stdout.on("data", async (data) => {
-			const lines = (data || "").toString("utf8").trim().split(/\r?\n/);
-			for (const line of lines) {
-				const l = line.trim();
-				if (!l) continue;
-
-				logs.push(l);
-
-				console.log(`[openvpn] ${t.configName} stdout: ${line}`);
-
-				if (l.includes("net_addr_v4_add")) {
-					const ip = l.match(/((25[0-5]|(2[0-4]|1\d|[1-9]|)\d)\.?\b){4}/);
-					if (!ip) continue;
-					t.interfaceIp = ip[0];
-					console.log(`[openvpn] ${t.configName} assigned IP ${t.interfaceIp}`);
-				} else if (l.includes("AUTH_FAILED")) {
-					const currentAuth = getCurrentAuth();
-					if (currentAuth.username === startAuth.username && currentAuth.password === startAuth.password) {
-						const credentials = await resetCredentials();
-
-						await ensureAuth(credentials.username, credentials.password);
-					}
-
-					process.kill();
-
-					return await launchOpenVPN(t).then(resolve).catch(reject);
-				} else if (l.includes("Initialization Sequence Completed")) {
-					resolve(t);
+			const exited = await run.exited;
+			if (!stopping && exited.authFailed) await refreshCredentialsIfUnchanged(credentialSnapshot);
+		} catch (error) {
+			console.error(`[tunnel] ${tunnel.configName} failed: ${error instanceof Error ? error.message : String(error)}`);
+			if (error instanceof OpenVpnError && error.authFailed && !stopping) {
+				try {
+					await refreshCredentialsIfUnchanged(credentialSnapshot);
+				} catch (refreshError) {
+					console.error(`[auth] credential reset failed: ${refreshError instanceof Error ? refreshError.message : String(refreshError)}`);
 				}
 			}
-		});
-
-		process.on("exit", (code, signal) => {
-			const allLogs = logs.join("\n");
-			const err = new Error(`OpenVPN process for ${t.configName} exited with code=${code} signal=${signal}\nLogs:\n${allLogs}`);
-			console.error(err.message);
-
-			launchOpenVPN(t).then(resolve).catch(reject);
-		});
-	});
+		} finally {
+			tunnel.state = stopping ? "stopped" : "backoff";
+			clearTunnelRoute(tunnel);
+			if (run) await stopOpenVpn(run.child);
+		}
+		if (stopping) break;
+		console.warn(`[tunnel] retrying ${tunnel.configName} in ${retryDelay}ms`);
+		await waitOrShutdown(retryDelay);
+		retryDelay = Math.min(RESTART_MAX_DELAY_MS, retryDelay * 2);
+	}
+	tunnel.state = "stopped";
 }
 
-async function wait(ms: number) {
-	return new Promise((r) => setTimeout(r, ms));
-}
-
-function createTcpProxy(t: TunnelInfo) {
+function createTunnelProxy(tunnel: TunnelInfo): Promise<void> {
 	const server = net.createServer({ allowHalfOpen: false }, (client) => {
-		client.once("data", (chunk) => processInitialClientData(chunk, client, () => t));
+		readProxyRequest(client, () => tunnel);
 	});
-	server.on("error", (e) => console.error(`Proxy ${t.configName}:${t.port} error`, e));
-	// Bun sometimes mis-identifies the 4-arg overload; use 3-arg then add 'listening' event
-	server.listen({ port: t.port, host: "0.0.0.0", backlog: CONNECT_BACKLOG });
-
-	return new Promise<void>((resolve, reject) => {
-		server.on("listening", () => {
-			console.log(`Proxy up for ${t.configName} dev=${t.devName} port=${t.port} localAddress=${t.interfaceIp || "default"}`);
+	proxyServers.add(server);
+	server.on("error", (error) => console.error(`[proxy:${tunnel.port}] ${error.message}`));
+	server.listen({ host: "0.0.0.0", port: tunnel.port, backlog: CONNECT_BACKLOG });
+	return new Promise((resolve, reject) => {
+		server.once("listening", () => {
+			console.log(`[proxy] ${tunnel.configName} listening on ${tunnel.port}`);
 			resolve();
 		});
-
-		server.on("error", (e) => reject(e));
+		server.once("error", reject);
 	});
 }
 
-function createRotatingProxy(port: number, tunnels: TunnelInfo[]) {
-	if (!tunnels.length) return;
-	let rr = 0; // round-robin index
+function createRotatingProxy(tunnels: TunnelInfo[]): Promise<void> {
+	let nextTunnel = 0;
 	const pickTunnel = (): TunnelInfo | undefined => {
-		if (!tunnels.length) return undefined;
-		let attempts = 0;
-		while (attempts < tunnels.length) {
-			const t = tunnels[rr % tunnels.length];
-			rr++;
-			attempts++;
-			if (!REQUIRE_TUN_IP || t.interfaceIp) return t;
+		for (let attempt = 0; attempt < tunnels.length; attempt += 1) {
+			const tunnel = tunnels[nextTunnel % tunnels.length];
+			nextTunnel += 1;
+			if (tunnelReady(tunnel)) return tunnel;
 		}
 		return undefined;
 	};
-	const server = net.createServer({ allowHalfOpen: false }, (client) => {
-		client.once("data", (chunk) => processInitialClientData(chunk, client, pickTunnel));
-	});
-	server.on("error", (e) => console.error(`Rotating proxy error on port ${port}`, e));
-	server.listen({ port, host: "0.0.0.0", backlog: CONNECT_BACKLOG });
-	server.on("listening", () => {
-		console.log(`Rotating proxy up on port ${port} across ${tunnels.length} tunnels (round-robin per request)`);
+	const server = net.createServer({ allowHalfOpen: false }, (client) => readProxyRequest(client, pickTunnel));
+	proxyServers.add(server);
+	server.on("error", (error) => console.error(`[proxy:${BASE_PORT}] ${error.message}`));
+	server.listen({ host: "0.0.0.0", port: BASE_PORT, backlog: CONNECT_BACKLOG });
+	return new Promise((resolve, reject) => {
+		server.once("listening", () => {
+			console.log(`[proxy] rotating listener on ${BASE_PORT} across ${tunnels.length} tunnel workers`);
+			resolve();
+		});
+		server.once("error", reject);
 	});
 }
 
-// DRY helper: parse first data chunk, determine target, and dispatch via selected tunnel.
-function processInitialClientData(firstChunk: Buffer, client: net.Socket, pickTunnel: () => TunnelInfo | undefined) {
-	const t = pickTunnel();
-	if (!t) {
-		client.destroy();
-		return;
-	}
-
-	const separator = "\r\n\r\n";
-	const separatorIndex = firstChunk.indexOf(separator);
-
-	if (separatorIndex === -1) {
-		client.destroy(); // Incomplete headers
-		return;
-	}
-
-	const headersPart = firstChunk.subarray(0, separatorIndex);
-	const restOfChunk = firstChunk.subarray(separatorIndex + separator.length);
-	const headers = headersPart.toString("utf8");
-	const firstLine = headers.split("\r\n")[0] || "";
-
-	if (/^CONNECT\s+/i.test(firstLine)) {
-		const target = firstLine.split(/\s+/)[1];
-		if (!target) {
-			client.destroy();
-			return;
-		}
-		// For CONNECT, we establish a tunnel. Any data after the headers is part of the tunnelled stream.
-		handleConnect(target, client, restOfChunk, t, false);
-	} else if (/^[A-Z]+\s+https?:\/\//.test(firstLine)) {
-		const hostLine = headers.match(/Host:\s*([^\r\n]+)/i);
-		const host = hostLine?.[1];
-		const urlHost =
-			host ||
-			(() => {
-				try {
-					// The second part of the request line is the URL
-					return new URL(firstLine.split(/\s+/)[1]).host;
-				} catch {
-					return undefined;
-				}
-			})();
-		if (!urlHost) {
-			client.destroy();
-			return;
-		}
-		// For HTTP forwarding, the whole first chunk is the request.
-		handleConnect(`${urlHost}:80`, client, firstChunk, t, true);
-	} else {
-		client.destroy();
-	}
+function rejectUnavailable(client: net.Socket): void {
+	if (!client.destroyed) client.end("HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\nNo Proton tunnel is ready");
 }
 
-function handleConnect(target: string, client: net.Socket, initialData: Buffer, tunnel: TunnelInfo, isHttpForward = false) {
-	// Leak protection: never forward without a bound tunnel IP
-	if (REQUIRE_TUN_IP && !tunnel.interfaceIp) {
-		client.destroy();
-		return;
-	}
-	const [host, portRaw] = target.split(":");
-	const port = parseInt(portRaw, 10) || 443;
-	if (!host || !/^[A-Za-z0-9_.-]+$/.test(host)) {
-		client.destroy();
-		return;
-	}
-
-	const connectWith = (dstIp: string) => {
-		console.log(`[proxy] ${tunnel.configName} forwarding to ${host}(${dstIp}):${port} from dev=${tunnel.devName}`);
-
-		console.log(`[socket] using dialer dev=${tunnel.devName} -> ${dstIp}:${port}`);
-		const remote = connectViaDialer(tunnel.devName, dstIp, port);
-
-		const setupPipe = () => {
-			client.pipe(remote).pipe(client);
-		};
-
-		remote.on("error", (err) => {
-			console.warn(`[dialer-socket-error] ${err.message}`);
-			client.destroy();
-		});
-		remote.on("close", () => client.destroy());
-		client.on("close", () => remote.destroy());
-		client.on("error", (err) => {
-			console.warn(`[client-socket-error] ${err.message}`);
-			remote.destroy();
-		});
-
-		if (isHttpForward) {
-			remote.write(initialData, (err) => {
-				if (err) {
-					client.destroy();
-					remote.destroy();
-				} else {
-					setupPipe();
-				}
-			});
-		} else {
-			client.write("HTTP/1.1 200 Connection Established\r\n\r\n", (err) => {
-				if (err) {
-					client.destroy();
-					remote.destroy();
-					return;
-				}
-				if (initialData.length > 0) {
-					remote.write(initialData, (err) => {
-						if (err) {
-							client.destroy();
-							remote.destroy();
-						} else {
-							setupPipe();
-						}
-					});
-				} else {
-					setupPipe();
-				}
-			});
-		}
+function readProxyRequest(client: net.Socket, pickTunnel: () => TunnelInfo | undefined): void {
+	let buffered = new Uint8Array(0);
+	const cleanup = () => {
+		client.off("data", onData);
+		client.off("timeout", onTimeout);
 	};
+	const onTimeout = () => {
+		cleanup();
+		client.destroy();
+	};
+	const onData = (chunk: Uint8Array) => {
+		const joined = new Uint8Array(buffered.byteLength + chunk.byteLength);
+		joined.set(buffered);
+		joined.set(chunk, buffered.byteLength);
+		buffered = joined;
+		if (buffered.length > 64 * 1024) {
+			cleanup();
+			client.destroy();
+			return;
+		}
+		const headerEnd = findHeaderDelimiter(buffered);
+		if (headerEnd < 0) return;
+		cleanup();
+		client.pause();
+		void handleProxyRequest(client, buffered, headerEnd, pickTunnel);
+	};
+	client.setTimeout(15_000);
+	client.on("data", onData);
+	client.once("error", cleanup);
+	client.once("close", cleanup);
+	client.once("timeout", onTimeout);
+}
 
-	// If target host is already an IP, use it directly; else resolve to IPv4 to avoid v6/v4 ambiguity
-	if (net.isIP(host)) {
-		connectWith(host);
-	} else {
-		dns.lookup(host, { family: 4 }, (err, address) => {
-			if (err || !address) {
-				client.destroy();
-				return;
-			}
-			connectWith(address);
-		});
+function findHeaderDelimiter(data: Uint8Array): number {
+	for (let index = 0; index + 3 < data.byteLength; index += 1) {
+		if (data[index] === 13 && data[index + 1] === 10 && data[index + 2] === 13 && data[index + 3] === 10) {
+			return index;
+		}
+	}
+	return -1;
+}
+
+function connectTarget(value: string, defaultPort: number): { host: string; port: number } | undefined {
+	try {
+		const target = new URL(`http://${value}`);
+		if (target.username || target.password || !target.hostname || target.pathname !== "/" || target.search || target.hash) return undefined;
+		const port = target.port ? Number.parseInt(target.port, 10) : defaultPort;
+		if (!Number.isInteger(port) || port < 1 || port > 65535) return undefined;
+		return { host: target.hostname, port };
+	} catch {
+		return undefined;
 	}
 }
 
-function sleep(ms: number) {
-	return new Promise((resolve) => setTimeout(resolve, ms));
+async function writeToSocket(socket: net.Socket, data: string | Uint8Array): Promise<void> {
+	await new Promise<void>((resolve, reject) => {
+		socket.write(data, (error) => (error ? reject(error) : resolve()));
+	});
 }
 
-async function main() {
-	await ensureTun();
+async function handleProxyRequest(
+	client: net.Socket,
+	firstChunk: Uint8Array,
+	headerEnd: number,
+	pickTunnel: () => TunnelInfo | undefined,
+): Promise<void> {
+	const tunnel = pickTunnel();
+	if (!tunnel || !tunnelReady(tunnel)) {
+		rejectUnavailable(client);
+		return;
+	}
+	const headerText = Buffer.from(firstChunk.subarray(0, headerEnd)).toString("latin1");
+	const firstLine = headerText.split("\r\n", 1)[0] || "";
+	const rest = firstChunk.subarray(headerEnd + 4);
+	let target: { host: string; port: number } | undefined;
+	let initialData: Uint8Array = new Uint8Array(0);
+	let isConnect = false;
 
-	const credentials = await resetCredentials.immediate();
-	await sleep(1000 * 5); // wait for credentials to propagate
+	const connectMatch = /^CONNECT\s+([^\s]+)\s+HTTP\/1\.[01]$/i.exec(firstLine);
+	if (connectMatch) {
+		target = connectTarget(connectMatch[1], 443);
+		initialData = rest;
+		isConnect = true;
+	} else {
+		const requestMatch = /^[A-Z]+\s+(https?:\/\/[^\s]+)\s+HTTP\/1\.[01]$/i.exec(firstLine);
+		if (requestMatch) {
+			try {
+				const url = new URL(requestMatch[1]);
+				if (url.protocol === "http:") {
+					target = { host: url.hostname, port: url.port ? Number.parseInt(url.port, 10) : 80 };
+					initialData = firstChunk;
+				}
+			} catch {
+				// Invalid absolute HTTP URL below falls through to a closed socket.
+			}
+		}
+	}
+	if (!target || !target.host || !Number.isInteger(target.port) || target.port < 1 || target.port > 65535) {
+		client.destroy();
+		return;
+	}
 
-	await ensureAuth(credentials.username, credentials.password);
-	await fs.mkdir(OPENVPN_BASE_LOG_DIR, { recursive: true });
-	await overrideDNS();
+	try {
+		const destinationIp = net.isIP(target.host)
+			? target.host
+			: (await dns.promises.lookup(target.host, { family: 4 })).address;
+		if (!net.isIPv4(destinationIp)) throw new Error("only IPv4 destinations are supported by the tunnel dialer");
+		const remote = await connectViaDialer(
+			tunnel.devName,
+			destinationIp,
+			target.port,
+			tunnel.routingMark,
+			tunnel.interfaceIp,
+			CONNECT_TIMEOUT_MS,
+		);
+		if (client.destroyed) {
+			remote.destroy();
+			return;
+		}
+		remote.once("error", () => client.destroy());
+		remote.once("close", () => client.destroy());
+		client.once("error", () => remote.destroy());
+		client.once("close", () => remote.destroy());
 
-	const configs = await listConfigs();
-	const tunnels = await assignPorts(configs);
-	console.log(`Launching ${tunnels.length} openvpn tunnels`);
-
-	console.log(`Starting rotating proxy on port ${BASE_PORT}`);
-
-	createRotatingProxy(BASE_PORT, tunnels);
-
-	const promises = tunnels.map((x) => launchOpenVPN(x).then((x) => createTcpProxy(x)));
-
-	await Promise.allSettled(promises);
-
-	console.log(`All Tunnels are up and running`);
-
-	console.log(`Service is ready. Connect your applications to the rotating proxy on port ${BASE_PORT}`);
+		if (isConnect) await writeToSocket(client, "HTTP/1.1 200 Connection Established\r\n\r\n");
+		if (initialData.length) await writeToSocket(remote, initialData);
+		client.setTimeout(0);
+		client.pipe(remote).pipe(client);
+		console.log(`[proxy] ${tunnel.devName} -> ${target.host}(${destinationIp}):${target.port}`);
+	} catch (error) {
+		console.warn(`[proxy] ${tunnel.devName} connection to ${target.host}:${target.port} failed: ${error instanceof Error ? error.message : String(error)}`);
+		client.destroy();
+	}
 }
 
-main().catch((e) => {
-	console.error(e);
-	process.exit(1);
-});
+async function waitForReadyTunnel(tunnels: TunnelInfo[]): Promise<void> {
+	const deadline = Date.now() + STARTUP_TIMEOUT_MS;
+	while (!stopping && Date.now() < deadline) {
+		if (tunnels.some(tunnelReady)) return;
+		await waitOrShutdown(250);
+	}
+	if (!tunnels.some(tunnelReady)) {
+		throw new Error(`No OpenVPN tunnel became ready within ${STARTUP_TIMEOUT_MS}ms (${tunnels.map((tunnel) => `${tunnel.configName}:${tunnel.state}`).join(", ")})`);
+	}
+}
+
+async function shutdown(tunnels: TunnelInfo[]): Promise<void> {
+	const firstShutdown = !stopping;
+	stopping = true;
+	if (firstShutdown) resolveShutdown();
+	for (const server of proxyServers) {
+		try {
+			server.close();
+		} catch {
+			// A closed listener has nothing left to clean up.
+		}
+	}
+	for (const tunnel of tunnels) clearTunnelRoute(tunnel);
+	await Promise.all([...activeOpenVpn].map((child) => stopOpenVpn(child)));
+}
+
+async function main(): Promise<void> {
+	validateRuntimeOptions();
+	await ensureTunDevice();
+	await ensureInitialAuth();
+	await overrideDns();
+
+	const tunnels = buildTunnels(await listConfigs());
+	signalTunnels = tunnels;
+	await createRotatingProxy(tunnels);
+	await Promise.all(tunnels.map(createTunnelProxy));
+	const workers = tunnels.map((tunnel) => superviseTunnel(tunnel));
+	try {
+		await waitForReadyTunnel(tunnels);
+		console.log(`[service] ready: ${tunnels.length} concurrent OpenVPN tunnel worker(s), rotating proxy on ${BASE_PORT}`);
+		await Promise.all(workers);
+	} finally {
+		await shutdown(tunnels);
+		await Promise.allSettled(workers);
+	}
+}
+
+let signalTunnels: TunnelInfo[] = [];
+
+async function run(): Promise<void> {
+	try {
+		await main();
+	} catch (error) {
+		console.error(error);
+		process.exitCode = 1;
+	}
+}
+
+process.once("SIGINT", () => void shutdown(signalTunnels));
+process.once("SIGTERM", () => void shutdown(signalTunnels));
+void run();

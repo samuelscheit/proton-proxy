@@ -1,17 +1,21 @@
-#version: "3.9"
-
 services:
   proton:
     build: .
-    container_name: proton_service
+    container_name: proton-proxy
     ports:
-      - "0.0.0.0:8100-8200:8100-8200" # increase when you have more openvpn configs
+      # 8100 is rotating; each selected .ovpn profile receives 8101, 8102, …
+      - "0.0.0.0:8100-8200:8100-8200"
     cap_add:
-      - NET_ADMIN             # Required for OpenVPN to modify network interfaces and routes
-    # devices:                # Usually not needed if mknod in app/run works for /dev/net/tun
-    #   - "/dev/net/tun:/dev/net/tun"
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
     env_file:
-      - .env                  # Load environment variables from .env file
-    restart: unless-stopped
+      - .env
+    environment:
+      BASE_PROXY_PORT: ${BASE_PROXY_PORT:-8100}
+      MAX_CONNECTIONS: ${MAX_CONNECTIONS:-0}
+      PORT_GAP: ${PORT_GAP:-1}
     volumes:
+      - ./ovpn_configs:/etc/openvpn/configs:ro
       - ./.user_data:/.user_data
+    restart: unless-stopped

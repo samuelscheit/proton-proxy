@@ -1,23 +1,24 @@
 import net from "net";
-import path from "path";
-// @ts-ignore
+// @ts-ignore — the native addon is built by the tundialer-native npm hook.
 import tundialer from "../tundialer-native/index.ts";
 
-// eslint-disable-next-line @typescript-eslint/no-var-requires
-// @ts-ignore
-
 /**
- * Connects to a destination using the native tundialer module,
- * binding the connection to a specific network device.
- * @param dev The network device (e.g., "tun0").
- * @param dstIp The destination IP address.
- * @param port The destination port.
- * @returns A net.Socket instance for the established connection.
+ * Open an IPv4 TCP socket constrained to one OpenVPN interface and policy
+ * routing mark. The native call is synchronous so the returned fd is already
+ * connected when Node adopts it; this function runs in the short-lived
+ * connection path and never mutates process-global routing state.
  */
-export function connectViaDialer(dev: string, dstIp: string, port: number): net.Socket {
-	const fd = tundialer.connect(dev, dstIp, port);
-	if (fd < 0) {
-		throw new Error("Failed to connect via tundialer");
-	}
-	return new net.Socket({ fd });
+export async function connectViaDialer(
+	dev: string,
+	dstIp: string,
+	port: number,
+	routingMark = 0,
+	sourceIp = "",
+	timeoutMs = 30_000,
+): Promise<net.Socket> {
+	const fd = typeof tundialer.connectAsync === "function"
+		? await tundialer.connectAsync(dev, dstIp, port, routingMark, sourceIp, timeoutMs)
+		: tundialer.connect(dev, dstIp, port, routingMark, sourceIp, timeoutMs);
+	if (!Number.isInteger(fd) || fd < 0) throw new Error(`Failed to connect via tundialer on ${dev}`);
+	return new net.Socket({ fd, readable: true, writable: true });
 }

@@ -1,27 +1,66 @@
-import { dirname, join } from "path";
 import { config } from "dotenv";
-import { chromium, type Response } from "patchright";
-import { readFileSync, writeFileSync } from "fs";
-import debounce from "./util.ts";
+import { existsSync, readFileSync, writeFileSync } from "fs";
+import { dirname, join } from "path";
+import { chromium, type Page } from "patchright";
 import { fileURLToPath } from "url";
-// import { debounce } from "lodash";
-import os from "os";
 
-const __filname = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filname);
+const filename = fileURLToPath(import.meta.url);
+const directory = dirname(filename);
 
-config({
-	path: join(__dirname, "..", ".env"),
-});
+config({ path: join(directory, "..", ".env") });
 
-function sleep(ms: number) {
-	return new Promise((resolve) => setTimeout(resolve, ms));
+const userDataDirectory = process.env.PROTON_USER_DATA_DIR || join(directory, "..", ".user_data");
+const storagePath = join(userDataDirectory, "storage.json");
+const resetEndpoint = "https://account.protonvpn.com/api/vpn/settings/reset";
+
+export interface OpenVpnCredentials {
+	username: string;
+	password: string;
 }
 
-async function login() {
-	console.log("Starting browser...");
+function sleep(milliseconds: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
 
-	const browser = await chromium.launchPersistentContext(join(__dirname, "..", ".user_data"), {
+function accountCredentials(): { username: string; password: string } {
+	const username = process.env.PROTON_USERNAME;
+	const password = process.env.PROTON_PASSWORD;
+	if (!username || !password) {
+		throw new Error("PROTON_USERNAME and PROTON_PASSWORD are required to reset OpenVPN credentials");
+	}
+	return { username, password };
+}
+
+async function restoreBrowserStorage(page: Page, browser: Awaited<ReturnType<typeof chromium.launchPersistentContext>>): Promise<void> {
+	if (!existsSync(storagePath)) return;
+	try {
+		const storage = JSON.parse(readFileSync(storagePath, "utf8"));
+		if (storage.cookies) await browser.addCookies(storage.cookies);
+		page.on("domcontentloaded", () => {
+			void page.evaluate((savedStorage) => {
+				for (const [key, value] of Object.entries(savedStorage.localStorage || {})) {
+					window.localStorage.setItem(key, value as string);
+				}
+				for (const [key, value] of Object.entries(savedStorage.sessionStorage || {})) {
+					window.sessionStorage.setItem(key, value as string);
+				}
+			}, storage);
+		});
+	} catch (error) {
+		console.warn(`[proton] ignoring unreadable saved browser storage: ${error instanceof Error ? error.message : String(error)}`);
+	}
+}
+
+async function persistBrowserStorage(page: Page, browser: Awaited<ReturnType<typeof chromium.launchPersistentContext>>): Promise<void> {
+	const serializedStorage = await page.evaluate(() => JSON.stringify({ localStorage, sessionStorage }));
+	const storage = JSON.parse(serializedStorage);
+	storage.cookies = await browser.cookies();
+	writeFileSync(storagePath, JSON.stringify(storage), "utf8");
+}
+
+async function login(): Promise<Page> {
+	console.log("[proton] starting account browser");
+	const browser = await chromium.launchPersistentContext(userDataDirectory, {
 		args: [
 			"--no-sandbox",
 			"--disable-setuid-sandbox",
@@ -31,156 +70,90 @@ async function login() {
 			"--no-zygote",
 			"--disable-gpu",
 			"--disable-software-rasterizer",
-			"--remote-debugging-port=9222",
-			"--remote-debugging-address=0.0.0.0",
 		],
 		headless: true,
 		channel: "chrome",
-		logger: {
-			isEnabled(name, severity) {
-				return true;
-			},
-			log(name, severity, message, args, hints) {
-				console.log(`[${name}] ${message}`, ...args);
-			},
-		},
 	});
-
 	const page = await browser.newPage();
+	await restoreBrowserStorage(page, browser);
 
-	try {
-		const savedStorage = JSON.parse(readFileSync(join(__dirname, "..", ".user_data", "storage.json"), "utf-8"));
+	const response = await page.goto("https://account.protonvpn.com/account-password", { waitUntil: "domcontentloaded" });
+	console.log(`[proton] account page loaded: ${response?.status() || "no response"}`);
+	const accountOrUsername = page.locator("section#account, #username");
+	await accountOrUsername.waitFor({ state: "attached", timeout: 30_000 });
+	const pageId = await accountOrUsername.evaluate((element) => element.id);
+	if (pageId === "account") return page;
 
-		if (savedStorage.cookies) {
-			browser.addCookies(savedStorage.cookies);
-		}
-
-		page.on("domcontentloaded", (p) => {
-			page.evaluate((s) => {
-				const { localStorage, sessionStorage } = s;
-				for (const [key, value] of Object.entries(localStorage || {})) {
-					window.localStorage.setItem(key, value as string);
-				}
-				for (const [key, value] of Object.entries(sessionStorage || {})) {
-					window.sessionStorage.setItem(key, value as string);
-				}
-			}, savedStorage);
-		});
-	} catch (error) {}
-
-	const r = await page.goto("https://account.protonvpn.com/account-password", { waitUntil: "domcontentloaded" });
-
-	console.log("Page loaded:", r?.status(), r?.statusText(), r?.url());
-
-	try {
-		var result = page.locator("section#account, #username");
-		await result.waitFor({ state: "attached", timeout: 30_000 });
-	} catch (error) {
-		const x = await page.innerHTML("body");
-		writeFileSync(join(__dirname, "..", ".user_data", "error.html"), x, "utf-8");
-		await page.screenshot({ path: join(__dirname, "..", ".user_data", "screenshot.png") as any });
-		throw error;
-	}
-	const id = await result?.evaluate((el) => el.id);
-
-	console.log("Detected page id:", id);
-
-	if (id === "account") return page;
-
-	console.log("Logging into Proton account...");
-
-	await page.type("#username", process.env.PROTON_USERNAME || "");
-
+	const credentials = accountCredentials();
+	console.log("[proton] logging in to the account page");
+	await page.fill("#username", credentials.username);
 	await page.click("button[type=submit]");
-	await page.locator("#password").waitFor({ state: "attached", timeout: 10000 });
-
-	await page.type("#password", process.env.PROTON_PASSWORD || "");
+	await page.locator("#password").waitFor({ state: "attached", timeout: 10_000 });
+	await page.fill("#password", credentials.password);
 	await page.click("button[type=submit]");
-
-	await page.waitForNavigation();
-
-	const s = await page.evaluate(() => {
-		return JSON.stringify({
-			localStorage,
-			sessionStorage,
-		});
-	});
-	const cookies = await browser.cookies();
-	const storage = JSON.parse(s);
-	storage.cookies = cookies;
-
-	writeFileSync(join(__dirname, "..", ".user_data", "storage.json"), JSON.stringify(storage), "utf-8");
-
-	console.log("Logged in to Proton account.");
-
+	await page.locator("section#account").waitFor({ state: "attached", timeout: 30_000 });
+	await persistBrowserStorage(page, browser);
+	console.log("[proton] account login completed");
 	return page;
 }
 
-const pagePromise = login();
+let pagePromise: Promise<Page> | undefined;
 
-export const resetCredentials = debounce(async function resetCredentials() {
-	const page = await pagePromise;
-
-	await page.locator("section#openvpn").waitFor({ state: "attached" });
-
-	const ovpn = page.locator("section#openvpn");
-	await ovpn.waitFor({ state: "attached" });
-	if (!ovpn) throw new Error("Could not find OpenVPN section");
-
-	await ovpn.scrollIntoViewIfNeeded();
-
-	const reset = ovpn.locator("button.button.button-medium.button-solid-norm");
-	await reset.waitFor({ state: "attached", timeout: 2000 });
-	if (!reset) throw new Error("Could not find Reset credentials button");
-
-	await reset.scrollIntoViewIfNeeded();
-
-	return new Promise<{
-		username: string;
-		password: string;
-	}>(async (resolve) => {
-		async function onResponse(response: Response) {
-			if (response.url() !== "https://account.protonvpn.com/api/vpn/settings/reset") return;
-
-			const json = await response.json();
-			try {
-				if (json.Error) {
-					page.locator("#password").fill(process.env.PROTON_PASSWORD || "");
-					await page.click(`button[type=submit][form="auth-form"]`);
-					await sleep(3000)
-
-					page.off("response", onResponse);
-
-					resetCredentials().then(resolve).catch(console.error);
-					return;
-				}
-
-				const { Name, Password } = json.VPNSettings;
-
-				console.log("New OpenVPN credentials:", {
-					username: Name,
-					password: Password,
-				});
-				
-				page.off("response", onResponse);
-
-				resolve({
-					username: Name,
-					password: Password,
-				});
-			} catch (error) {
-				console.error("Failed to parse OpenVPN credentials response:", json, error);
-			}
-		}
-
-		page.on("response", onResponse);
-
-		console.log("Resetting OpenVPN credentials...");
-
-		await sleep(1000);
-
-		await reset.click({});
+function accountPage(): Promise<Page> {
+	pagePromise ??= login().catch((error) => {
+		pagePromise = undefined;
+		throw error;
 	});
-}, 1000 * 20)!;
+	return pagePromise;
+}
 
-// resetCredentials().then(console.log).catch(console.error);
+async function resetCredentialsWithPage(page: Page, retryAfterPasswordPrompt: boolean): Promise<OpenVpnCredentials> {
+	const openVpnSection = page.locator("section#openvpn");
+	await openVpnSection.waitFor({ state: "attached", timeout: 30_000 });
+	await openVpnSection.scrollIntoViewIfNeeded();
+	const resetButton = openVpnSection.locator("button.button.button-medium.button-solid-norm");
+	await resetButton.waitFor({ state: "attached", timeout: 10_000 });
+
+	const responsePromise = page.waitForResponse((response) => response.url() === resetEndpoint, { timeout: 30_000 });
+	console.log("[proton] resetting OpenVPN credentials");
+	await resetButton.click();
+	const response = await responsePromise;
+	const body = await response.json();
+	if (!body?.Error) {
+		const username = body?.VPNSettings?.Name;
+		const password = body?.VPNSettings?.Password;
+		if (typeof username !== "string" || !username || typeof password !== "string" || !password) {
+			throw new Error("Proton returned an invalid OpenVPN credential response");
+		}
+		return { username, password };
+	}
+
+	if (!retryAfterPasswordPrompt) {
+		throw new Error(`Proton rejected the OpenVPN credential reset: ${String(body.Error)}`);
+	}
+	const passwordInput = page.locator("#password");
+	if ((await passwordInput.count()) === 0) {
+		throw new Error(`Proton rejected the OpenVPN credential reset: ${String(body.Error)}`);
+	}
+	await passwordInput.fill(accountCredentials().password);
+	await page.click('button[type=submit][form="auth-form"]');
+	await sleep(3000);
+	return resetCredentialsWithPage(page, false);
+}
+
+let credentialReset: Promise<OpenVpnCredentials> | undefined;
+
+/**
+ * Proton's OpenVPN password is account-wide.  Sharing one in-flight reset is
+ * essential when several active OpenVPN tunnels see AUTH_FAILED together:
+ * resetting it per tunnel repeatedly invalidates the credential every other
+ * tunnel is trying to use.
+ */
+export function resetCredentials(): Promise<OpenVpnCredentials> {
+	if (!credentialReset) {
+		credentialReset = accountPage().then((page) => resetCredentialsWithPage(page, true)).finally(() => {
+			credentialReset = undefined;
+		});
+	}
+	return credentialReset;
+}

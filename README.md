@@ -1,62 +1,102 @@
-# Proton-Multi-Rotating Docker
+# Proton multi-tunnel HTTP CONNECT proxy
 
-This project sets up a HTTP proxy that routes all its traffic through multiple ProtonVPN OpenVPN connection. The choosen tunnel is automatically rotated for each request.
+This service exposes an HTTP CONNECT proxy whose outbound TCP connections are
+sent through one or more ProtonVPN **OpenVPN** profiles. It is designed for
+multiple connections in one container/network namespace without letting their
+routes bleed into each other.
+
+## What multi-tunnel mode does
+
+Place several downloaded Proton `.ovpn` files in `ovpn_configs/` and start the
+container with `MAX_CONNECTIONS` set to the number of profiles to use (or `0`,
+the default, to use all of them). The service then starts all selected OpenVPN
+processes concurrently:
+
+| Endpoint | Behavior |
+| --- | --- |
+| `http://host:8100` | Rotates each new HTTP/CONNECT request round-robin across healthy tunnels. |
+| `http://host:8101` | Pins requests to the first selected profile (`tun0`). |
+| `http://host:8102` | Pins requests to the second selected profile (`tun1`). |
+| `…` | One subsequent listener per selected profile. |
+
+`BASE_PROXY_PORT` changes `8100`; `PORT_GAP` changes the interval between the
+rotating listener and per-tunnel listeners.
+
+### Isolation model
+
+Opening several OpenVPN interfaces alone is **not** sufficient: a normal socket
+can still follow the container's default route. For each tunnel, this service
+creates a private Linux policy-routing table and a unique fwmark. The native
+dialer then applies all of the following to every outbound socket before it
+connects:
+
+1. `SO_BINDTODEVICE=tunN`
+2. the tunnel-specific `SO_MARK`
+3. a local bind to the IPv4 address assigned to `tunN`
+
+The marked socket therefore resolves through only its matching policy-routing
+table. The global/default route remains untouched. If the required interface,
+route, mark, or source address cannot be used, the connection fails closed;
+there is no direct-route fallback.
 
 ## Prerequisites
 
--   Docker
--   Docker Compose
--   A ProtonVPN account (Free or Paid)
+- Docker / Docker Compose
+- A ProtonVPN account and downloaded OpenVPN profiles from the
+  [Proton downloads page](https://account.protonvpn.com/downloads)
+- `NET_ADMIN` and `/dev/net/tun` access in the container
 
-## Setup
+`PVPN_USERNAME` and `PVPN_PASSWORD` are ProtonVPN OpenVPN/IKEv2 credentials,
+not your normal Proton account login. `PROTON_USERNAME` and `PROTON_PASSWORD`
+are only needed to automatically reset an expired OpenVPN credential pair.
 
-1.  **Clone the Repository (if applicable later):**
-    ```bash
-    git clone <repository_url>
-    cd proton-docker
-    ```
+## Quick start
 
-2.  **OpenVPN Configurations:**
-    -   Download your desired ProtonVPN OpenVPN configuration files (UDP recommended) from the [ProtonVPN Account Downloads page](https://account.protonvpn.com/downloads).
-    -   Place the `.ovpn` files into the `ovpn_configs/` directory in this project.
-
-3.  **Create `.env` File:**
-    -   Copy the example environment file:
-        ```bash
-        cp .env.example .env
-        ```
-    -   Edit the `.env` file and fill in your ProtonVPN credentials and other settings:
-        ```env
-        PVPN_USERNAME=YOUR_PROTONVPN_OPENVPN_USERNAME
-        PVPN_PASSWORD=YOUR_PROTONVPN_OPENVPN_PASSWORD
-
-        # Optional: Set the rotation interval in seconds (default is 300 seconds / 5 minutes)
-        ROTATION_INTERVAL=300
-
-        # Optional: Override DNS servers used by the container after VPN connection.
-        # Comma-separated. Examples:
-        # DNS_SERVERS_OVERRIDE=1.1.1.1,1.0.0.1 # Cloudflare
-        # DNS_SERVERS_OVERRIDE=8.8.8.8,8.8.4.4 # Google
-        # DNS_SERVERS_OVERRIDE=10.2.0.1       # Example ProtonVPN internal DNS
-        DNS_SERVERS_OVERRIDE=
-        ```
-    **IMPORTANT:** The `PVPN_USERNAME` and `PVPN_PASSWORD` are your OpenVPN/IKEv2 credentials, **not** your main Proton account login. You can find these in your ProtonVPN account dashboard under Account -> OpenVPN / IKEv2 username.
-
-4.  **Build and Run:**
-    ```bash
-    docker-compose build
-    docker-compose up -d
-    ```
-
-## Usage
-
-Once the container is running, configure your browser or application to use an HTTP proxy:
-
--   **Host/Address:** `localhost` (if running Docker locally) or the IP address of the machine running Docker.
--   **Port:** `8100` (or as configured in `docker-compose.yml`).
-
-For multi-connection mode, pick the port of the container corresponding to the desired tunnel.
-
-Check the logs to see the VPN server rotation:
 ```bash
-docker-compose logs -f proton_service
+git clone https://github.com/samuelscheit/proton-proxy
+cd proton-proxy
+cp .env.example.txt .env
+mkdir -p ovpn_configs
+cp ~/Downloads/*.ovpn ovpn_configs/
+# Set PVPN_USERNAME and PVPN_PASSWORD in .env.
+# Set MAX_CONNECTIONS=3 to use three profiles, for example.
+docker compose up --build
+```
+
+The bundled compose file publishes `8100-8200`. Do not publish the sidecar
+ports when it is used from another service on the same Docker network; use its
+internal DNS name instead.
+
+## Runtime settings
+
+| Variable | Default | Meaning |
+| --- | ---: | --- |
+| `MAX_CONNECTIONS` | `0` | Maximum selected `.ovpn` files; `0` uses every profile. |
+| `BASE_PROXY_PORT` | `8100` | Rotating HTTP CONNECT listener. |
+| `PORT_GAP` | `1` | Port increment for individual tunnel listeners. |
+| `CONNECT_TIMEOUT_MS` | `30000` | Per-outbound-connect timeout. |
+| `TUN_IP_WAIT_MS` | `30000` | How long to wait for an OpenVPN interface IPv4 assignment. |
+| `STARTUP_TIMEOUT_MS` | `120000` | How long startup waits for at least one healthy tunnel. |
+| `REQUIRE_TUN_IP` | `true` | Refuse to serve a tunnel until it has an IPv4 address. Keep enabled. |
+| `RESET_CREDENTIALS_ON_START` | `false` | Explicitly reset the shared Proton OpenVPN credential pair at boot. Normally leave disabled. |
+| `ROUTING_TABLE_BASE` | `10000` | First private Linux routing table ID. |
+| `ROUTING_MARK_BASE` | `5898240` | First socket fwmark (`0x5a0000`). |
+| `ROUTING_RULE_PRIORITY_BASE` | `12000` | First policy-rule priority. |
+
+A Proton credential reset invalidates the account-wide OpenVPN credential pair.
+When `AUTH_FAILED` occurs, the service coalesces concurrent failures into one
+reset and restarts all active tunnel workers with the replacement pair.
+Proton may enforce a plan-specific simultaneous-connection limit. Profiles over
+that limit keep retrying independently; they never share another profile's
+route or fall back to the host's default route.
+
+## Operational notes
+
+- Only IPv4 destinations are supported by the tunnel dialer. Destination
+  hostnames are resolved to IPv4 before the socket is opened.
+- The proxy buffers up to 64 KiB while waiting for a complete HTTP header.
+  This handles TCP-fragmented CONNECT requests correctly.
+- A rotating-port request made before any tunnel is healthy receives HTTP 503;
+  it is never forwarded directly.
+- Per-tunnel ports are useful for diagnostics. Use the rotating port for normal
+  request distribution.

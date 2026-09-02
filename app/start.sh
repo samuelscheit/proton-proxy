@@ -7,4 +7,4 @@ rm -f /.user_data/SingletonLock
 rm -f /.user_data/SingletonSocket
 rm -f /.user_data/SingletonCookie
 
-node /app/index.ts
+exec node /app/index.ts

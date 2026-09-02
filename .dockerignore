@@ -1,0 +1,11 @@
+.git
+.git/**
+node_modules
+**/node_modules
+.user_data
+.env
+*.log
+build
+**/build
+ovpn_configs/*.ovpn
+ovpn_configs/*.conf
