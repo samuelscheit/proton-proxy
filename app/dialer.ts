@@ -1,6 +1,6 @@
 import net from "net";
 // @ts-ignore — the native addon is built by the tundialer-native npm hook.
-import tundialer from "../tundialer-native/index.ts";
+import tundialer from "../tundialer-native/index.js";
 
 /**
  * Open an IPv4 TCP socket constrained to one OpenVPN interface and policy
