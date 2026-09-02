@@ -372,6 +372,7 @@ function startOpenVpn(tunnel: TunnelInfo): OpenVpnRun {
 	let readySettled = false;
 	let exitSettled = false;
 	let authFailed = false;
+	let authStopRequested = false;
 	let logs: string[] = [];
 	let stdoutRemainder = "";
 	let stderrRemainder = "";
@@ -414,7 +415,21 @@ function startOpenVpn(tunnel: TunnelInfo): OpenVpnRun {
 			logs.push(line);
 			if (logs.length > 200) logs = logs.slice(-200);
 			console.log(`[openvpn:${tunnel.devName}:${source}] ${line}`);
-			if (line.includes("AUTH_FAILED")) authFailed = true;
+			if (line.includes("AUTH_FAILED")) {
+				authFailed = true;
+				// `--auth-retry nointeract` can keep OpenVPN reconnecting forever
+				// after an authentication failure. Stop this worker explicitly so
+				// the supervisor can refresh the account-wide credential once and
+				// restart every profile with the new pair.
+				if (!authStopRequested && !stopping && child.exitCode === null) {
+					authStopRequested = true;
+					try {
+						child.kill("SIGTERM");
+					} catch {
+						// The process may have exited between the check and kill.
+					}
+				}
+			}
 			if (line.includes("net_addr_v4_add")) tunnel.interfaceIp = parseIPv4(line) || tunnel.interfaceIp;
 			if (line.includes("Initialization Sequence Completed") && !readySettled) {
 				readySettled = true;
