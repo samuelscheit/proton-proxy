@@ -94,7 +94,6 @@ const shutdownSignal = new Promise<void>((resolve) => {
 });
 const proxyServers = new Set<net.Server>();
 const activeOpenVpn = new Set<ChildProcess>();
-const activeWireGuard = new Set<string>();
 let credentialRefresh: Promise<void> | undefined;
 
 function integerFromEnv(name: string, fallback: number): number {
@@ -354,6 +353,14 @@ function wireGuardInterfaceExists(device: string): boolean {
 	return result.status === 0;
 }
 
+function wireGuardInterfaceIsUp(device: string): boolean {
+	const result = spawnSync(IP_BIN, ["-o", "link", "show", "dev", device], {
+		encoding: "utf8",
+		stdio: ["ignore", "pipe", "ignore"],
+	});
+	return result.status === 0 && /<[^>]*\bUP\b[^>]*>/.test(result.stdout || "");
+}
+
 function wireGuardInterfaceIsKernelDevice(device: string): boolean {
 	const result = spawnSync(IP_BIN, ["-d", "link", "show", "dev", device], {
 		encoding: "utf8",
@@ -363,12 +370,12 @@ function wireGuardInterfaceIsKernelDevice(device: string): boolean {
 }
 
 function wireGuardConfigured(device: string): boolean {
-	const result = spawnSync(WIREGUARD_BIN, ["show", "interfaces"], {
+	const result = spawnSync(WIREGUARD_BIN, ["show", device, "peers"], {
 		encoding: "utf8",
 		stdio: ["ignore", "pipe", "ignore"],
 	});
 	if (result.status !== 0) return false;
-	return (result.stdout || "").split(/\s+/).includes(device);
+	return (result.stdout || "").split(/\s+/).some((peer) => peer.length > 0);
 }
 
 function ensureWireGuardBinary(): void {
@@ -387,7 +394,6 @@ function removeWireGuardInterface(device: string): void {
 	// It is intentionally idempotent so failed partial startups and shutdowns
 	// cannot leave a stale interface that receives a later tunnel's traffic.
 	if (!wireGuardInterfaceExists(device)) {
-		activeWireGuard.delete(device);
 		return;
 	}
 	if (!wireGuardInterfaceIsKernelDevice(device)) {
@@ -395,7 +401,6 @@ function removeWireGuardInterface(device: string): void {
 		return;
 	}
 	runIp(["link", "del", "dev", device], `remove ${device} WireGuard interface`, true);
-	activeWireGuard.delete(device);
 }
 
 async function startWireGuard(tunnel: TunnelInfo): Promise<WireGuardRun> {
@@ -409,7 +414,6 @@ async function startWireGuard(tunnel: TunnelInfo): Promise<WireGuardRun> {
 	// route. The address below is re-read from the freshly created device.
 	tunnel.interfaceIp = undefined;
 	runIp(["link", "add", "dev", tunnel.devName, "type", "wireguard"], `create ${tunnel.devName} WireGuard interface`);
-	activeWireGuard.add(tunnel.devName);
 	const temporaryPath = `/run/proton-proxy-${process.pid}-${tunnel.devName}-${Date.now()}.conf`;
 	try {
 		await fs.writeFile(temporaryPath, stripped, { mode: 0o600 });
@@ -441,7 +445,7 @@ async function waitForWireGuardFailure(tunnel: TunnelInfo): Promise<void> {
 	while (!stopping) {
 		await waitOrShutdown(WIREGUARD_HEALTH_CHECK_INTERVAL_MS);
 		if (stopping) return;
-		if (!wireGuardInterfaceExists(tunnel.devName) || !wireGuardConfigured(tunnel.devName)) {
+		if (!wireGuardInterfaceIsUp(tunnel.devName) || !wireGuardConfigured(tunnel.devName)) {
 			throw new Error(`WireGuard interface ${tunnel.devName} disappeared or lost its peer configuration`);
 		}
 	}
@@ -902,12 +906,12 @@ async function shutdown(tunnels: TunnelInfo[]): Promise<void> {
 
 async function main(): Promise<void> {
 	validateRuntimeOptions();
-	await ensureTunDevice();
 	await overrideDns();
 
 	const tunnels = buildTunnels(await listConfigs());
 	signalTunnels = tunnels;
 	if (tunnels.some((tunnel) => tunnel.protocol === "wireguard")) ensureWireGuardBinary();
+	if (tunnels.some((tunnel) => tunnel.protocol === "openvpn")) await ensureTunDevice();
 	if (tunnels.some((tunnel) => tunnel.protocol === "openvpn")) await ensureInitialAuth();
 	let workers: Promise<void>[] = [];
 	try {
