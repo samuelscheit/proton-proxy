@@ -329,6 +329,16 @@ function runWireGuard(arguments_: string[], description: string, allowFailure = 
 	throw new Error(`${description} failed${output ? `: ${output}` : spawnError}`);
 }
 
+function setSysctl(name: string, value: string): void {
+	const result = spawnSync("sysctl", ["-q", "-w", `${name}=${value}`], {
+		encoding: "utf8",
+		stdio: ["ignore", "pipe", "pipe"],
+	});
+	if (result.status === 0) return;
+	const detail = `${result.stdout || ""}\n${result.stderr || ""}`.trim();
+	console.warn(`[routing] unable to set ${name}=${value}${detail ? `: ${detail}` : ""}`);
+}
+
 function wireGuardInterfaceExists(device: string): boolean {
 	const result = spawnSync(IP_BIN, ["link", "show", "dev", device], {
 		encoding: "utf8",
@@ -469,7 +479,8 @@ function configureTunnelRoute(tunnel: TunnelInfo): void {
 	);
 	// A marked packet deliberately arrives through a private route table. Strict
 	// rp_filter would discard its reply before userspace sees it.
-	spawnSync("sysctl", ["-q", "-w", `net.ipv4.conf.${tunnel.devName}.rp_filter=0`], { stdio: "ignore" });
+	setSysctl("net.ipv4.conf.all.src_valid_mark", "1");
+	setSysctl(`net.ipv4.conf.${tunnel.devName}.rp_filter`, "0");
 	console.log(`[routing] ${tunnel.devName}: mark=0x${tunnel.routingMark.toString(16)} table=${tunnel.routingTable}`);
 }
 
