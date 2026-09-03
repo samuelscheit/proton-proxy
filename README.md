@@ -14,13 +14,21 @@ service then starts all selected tunnel workers concurrently:
 
 | Endpoint | Behavior |
 | --- | --- |
-| `http://host:8100` | Rotates each new HTTP/CONNECT request round-robin across healthy tunnels. |
+| `http://host:8100` | Selects a healthy tunnel by the optional `proton-session` proxy-auth token; callers without one are distributed round-robin. |
 | `http://host:8101` | Pins requests to the first selected profile (`tun0` or `wg0`). |
 | `http://host:8102` | Pins requests to the second selected profile (`tun1` or `wg1`). |
 | `…` | One subsequent listener per selected profile. |
 
 `BASE_PROXY_PORT` changes `8100`; `PORT_GAP` changes the interval between the
 rotating listener and per-tunnel listeners.
+
+The rotating listener supports sticky sessions without exposing tunnel state:
+send `Proxy-Authorization: Basic <base64(proton-session:<64-hex-token>)>` on
+each CONNECT request. The same token is rendezvous-hashed to the same healthy
+tunnel, so a chat/session can keep one VPN exit across multiple connections.
+If that tunnel is unavailable, the token is remapped to another healthy tunnel;
+once it returns, normal rendezvous selection restores the original mapping.
+Credentials with any other username are ignored, and the token is never logged.
 
 ### Isolation model
 

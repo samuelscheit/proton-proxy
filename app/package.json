@@ -1,12 +1,12 @@
 {
   "name": "proton-privoxy-app",
   "version": "1.0.0",
-  "description": "Application logic for multi-tunnel OpenVPN with rotating proxy",
+  "description": "Application logic for multi-tunnel OpenVPN with sticky rotating proxy sessions",
   "main": "index.ts",
   "type": "module",
   "scripts": {
     "check": "tsc --noEmit",
-    "test": "node --experimental-strip-types --test ./tunnel_profiles_test.ts",
+    "test": "node --experimental-strip-types --test ./tunnel_profiles_test.ts ./session_affinity_test.ts",
     "start": "node ./index.ts",
     "preinstall": "cd ../tundialer-native && npm ci"
   },

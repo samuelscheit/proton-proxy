@@ -1,4 +1,5 @@
 import { spawn, spawnSync, type ChildProcess } from "child_process";
+import { parseProtonSessionToken, rendezvousIndex } from "./session_affinity.ts";
 import { existsSync, promises as fs, readFileSync } from "fs";
 import dns from "dns";
 import net from "net";
@@ -14,12 +15,14 @@ import { listTunnelProfiles, stripWireGuardConfig, type TunnelProfile, type Tunn
  *
  * Every OpenVPN or WireGuard profile receives a stable tunnel interface, its
  * own route table, a per-socket fwmark, and an individual HTTP proxy listener.
- * The listener on BASE_PROXY_PORT rotates only across healthy tunnels. Route
+ * The listener on BASE_PROXY_PORT selects a healthy tunnel by the optional
+ * proton-session affinity token (or round-robins callers without one). Route
  * isolation is intentionally per socket; no global default route is ever
  * changed after startup.
  */
 
 type TunnelState = "starting" | "ready" | "backoff" | "stopped";
+type TunnelPicker = (sessionToken?: string) => TunnelInfo | undefined;
 
 interface TunnelInfo {
 	configPath: string;
@@ -715,7 +718,15 @@ function createTunnelProxy(tunnel: TunnelInfo): Promise<void> {
 
 function createRotatingProxy(tunnels: TunnelInfo[]): Promise<void> {
 	let nextTunnel = 0;
-	const pickTunnel = (): TunnelInfo | undefined => {
+	const pickTunnel: TunnelPicker = (sessionToken) => {
+		if (sessionToken) {
+			const healthy = tunnels.filter(tunnelReady);
+			const index = rendezvousIndex(
+				sessionToken,
+				healthy.map((tunnel) => tunnel.devName),
+			);
+			if (index !== undefined) return healthy[index];
+		}
 		for (let attempt = 0; attempt < tunnels.length; attempt += 1) {
 			const tunnel = tunnels[nextTunnel % tunnels.length];
 			nextTunnel += 1;
@@ -740,7 +751,7 @@ function rejectUnavailable(client: net.Socket): void {
 	if (!client.destroyed) client.end("HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\nNo Proton tunnel is ready");
 }
 
-function readProxyRequest(client: net.Socket, pickTunnel: () => TunnelInfo | undefined): void {
+function readProxyRequest(client: net.Socket, pickTunnel: TunnelPicker): void {
 	let buffered = new Uint8Array(0);
 	const cleanup = () => {
 		client.off("data", onData);
@@ -804,14 +815,15 @@ async function handleProxyRequest(
 	client: net.Socket,
 	firstChunk: Uint8Array,
 	headerEnd: number,
-	pickTunnel: () => TunnelInfo | undefined,
+	pickTunnel: TunnelPicker,
 ): Promise<void> {
-	const tunnel = pickTunnel();
+	const headerText = Buffer.from(firstChunk.subarray(0, headerEnd)).toString("latin1");
+	const sessionToken = parseProtonSessionToken(headerText);
+	const tunnel = pickTunnel(sessionToken);
 	if (!tunnel || !tunnelReady(tunnel)) {
 		rejectUnavailable(client);
 		return;
 	}
-	const headerText = Buffer.from(firstChunk.subarray(0, headerEnd)).toString("latin1");
 	const firstLine = headerText.split("\r\n", 1)[0] || "";
 	const rest = firstChunk.subarray(headerEnd + 4);
 	let target: { host: string; port: number } | undefined;

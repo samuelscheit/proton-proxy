@@ -3,7 +3,8 @@ services:
     build: .
     container_name: proton-proxy
     ports:
-      # 8100 is rotating; each selected OpenVPN/WireGuard profile gets 8101, 8102, …
+      # 8100 is the affinity-aware rotating listener; each selected
+      # OpenVPN/WireGuard profile also gets a fixed listener at 8101, 8102, …
       - "0.0.0.0:8100-8200:8100-8200"
     cap_add:
       - NET_ADMIN
