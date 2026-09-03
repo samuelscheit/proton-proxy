@@ -330,6 +330,13 @@ function runWireGuard(arguments_: string[], description: string, allowFailure = 
 }
 
 function setSysctl(name: string, value: string): void {
+	const procPath = `/proc/sys/${name.replace(/\./g, "/")}`;
+	try {
+		if (readFileSync(procPath, "utf8").trim() === value) return;
+	} catch {
+		// Fall through to the write so the resulting warning explains whether the
+		// runtime lacks this sysctl entirely or merely denies the update.
+	}
 	const result = spawnSync("sysctl", ["-q", "-w", `${name}=${value}`], {
 		encoding: "utf8",
 		stdio: ["ignore", "pipe", "pipe"],
