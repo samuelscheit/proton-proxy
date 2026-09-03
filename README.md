@@ -29,6 +29,10 @@ tunnel, so a chat/session can keep one VPN exit across multiple connections.
 If that tunnel is unavailable, the token is remapped to another healthy tunnel;
 once it returns, normal rendezvous selection restores the original mapping.
 Credentials with any other username are ignored, and the token is never logged.
+When a gateway request with a valid session token reaches a fixed-profile
+listener whose profile is temporarily unavailable, the listener remaps that
+request to a healthy tunnel deterministically. Unauthenticated fixed-listener
+requests retain strict pinning and receive `503` until that profile is ready.
 
 ### Isolation model
 

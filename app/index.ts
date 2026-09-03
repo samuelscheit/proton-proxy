@@ -704,9 +704,25 @@ async function superviseTunnel(tunnel: TunnelInfo): Promise<void> {
 	tunnel.state = "stopped";
 }
 
-function createTunnelProxy(tunnel: TunnelInfo): Promise<void> {
+function sessionTunnel(tunnels: TunnelInfo[], sessionToken: string): TunnelInfo | undefined {
+	const healthy = tunnels.filter(tunnelReady);
+	const index = rendezvousIndex(
+		sessionToken,
+		healthy.map((candidate) => candidate.devName),
+	);
+	return index === undefined ? undefined : healthy[index];
+}
+
+function createTunnelProxy(tunnel: TunnelInfo, allTunnels: TunnelInfo[]): Promise<void> {
 	const server = net.createServer({ allowHalfOpen: false }, (client) => {
-		readProxyRequest(client, () => tunnel);
+		readProxyRequest(client, (sessionToken) => {
+			if (tunnelReady(tunnel)) return tunnel;
+			// A fixed listener normally pins its profile. If the gateway supplied
+			// an affinity token, fail over deterministically rather than returning
+			// 503 while that profile is restarting. Unauthenticated diagnostics
+			// retain the strict fixed-profile behavior.
+			return sessionToken ? sessionTunnel(allTunnels, sessionToken) : undefined;
+		});
 	});
 	proxyServers.add(server);
 	server.on("error", (error) => console.error(`[proxy:${tunnel.port}] ${error.message}`));
@@ -724,12 +740,8 @@ function createRotatingProxy(tunnels: TunnelInfo[]): Promise<void> {
 	let nextTunnel = 0;
 	const pickTunnel: TunnelPicker = (sessionToken) => {
 		if (sessionToken) {
-			const healthy = tunnels.filter(tunnelReady);
-			const index = rendezvousIndex(
-				sessionToken,
-				healthy.map((tunnel) => tunnel.devName),
-			);
-			if (index !== undefined) return healthy[index];
+			const selected = sessionTunnel(tunnels, sessionToken);
+			if (selected) return selected;
 		}
 		for (let attempt = 0; attempt < tunnels.length; attempt += 1) {
 			const tunnel = tunnels[nextTunnel % tunnels.length];
@@ -936,7 +948,7 @@ async function main(): Promise<void> {
 	let workers: Promise<void>[] = [];
 	try {
 		await createRotatingProxy(tunnels);
-		await Promise.all(tunnels.map(createTunnelProxy));
+		await Promise.all(tunnels.map((tunnel) => createTunnelProxy(tunnel, tunnels)));
 		workers = tunnels.map((tunnel) => superviseTunnel(tunnel));
 		await waitForReadyTunnel(tunnels);
 		const openVpnCount = tunnels.filter((tunnel) => tunnel.protocol === "openvpn").length;
