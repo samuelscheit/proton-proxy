@@ -11,7 +11,8 @@ ENV PVPN_USERNAME="" \
     BASE_PROXY_PORT="8100" \
     PORT_GAP="1" \
     REQUIRE_TUN_IP="true" \
-    RESET_CREDENTIALS_ON_START="false"
+    RESET_CREDENTIALS_ON_START="false" \
+    WIREGUARD_HEALTH_CHECK_INTERVAL_MS="5000"
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -33,6 +34,7 @@ RUN apt-get update \
         openvpn \
         procps \
         python3 \
+        wireguard-tools \
         wget \
     && mkdir -p /etc/openvpn/configs \
     && wget -q --https-only \
@@ -51,8 +53,8 @@ RUN npm ci \
 
 COPY app /app
 
-# OpenVPN profiles and credentials are runtime inputs. Mount profiles at
-# /etc/openvpn/configs instead of baking private .ovpn material into an image.
+# VPN profiles and credentials are runtime inputs. Mount profiles at
+# /etc/openvpn/configs instead of baking private .ovpn/.conf material into an image.
 RUN mkdir -p /etc/openvpn/configs \
     && chmod 0755 /app/start.sh \
     && npm run check

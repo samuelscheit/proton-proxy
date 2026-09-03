@@ -6,6 +6,7 @@
   "type": "module",
   "scripts": {
     "check": "tsc --noEmit",
+    "test": "node --experimental-strip-types --test ./tunnel_profiles_test.ts",
     "start": "node ./index.ts",
     "preinstall": "cd ../tundialer-native && npm ci"
   },

@@ -3,7 +3,7 @@ import net from "net";
 import tundialer from "../tundialer-native/index.js";
 
 /**
- * Open an IPv4 TCP socket constrained to one OpenVPN interface and policy
+ * Open an IPv4 TCP socket constrained to one VPN interface and policy
  * routing mark. The native call is synchronous so the returned fd is already
  * connected when Node adopts it; this function runs in the short-lived
  * connection path and never mutates process-global routing state.

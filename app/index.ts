@@ -7,13 +7,14 @@ import { URL } from "url";
 
 import { resetCredentials, type OpenVpnCredentials } from "./browser.ts";
 import { connectViaDialer } from "./dialer.ts";
+import { listTunnelProfiles, stripWireGuardConfig, type TunnelProfile, type TunnelProtocol } from "./tunnel_profiles.ts";
 
 /**
  * A multi-tunnel Proton HTTP CONNECT proxy.
  *
- * Every OpenVPN profile receives a stable `tunN` interface, its own route
- * table, a per-socket fwmark, and an individual HTTP proxy listener. The
- * listener on BASE_PROXY_PORT rotates only across healthy tunnels. The route
+ * Every OpenVPN or WireGuard profile receives a stable tunnel interface, its
+ * own route table, a per-socket fwmark, and an individual HTTP proxy listener.
+ * The listener on BASE_PROXY_PORT rotates only across healthy tunnels. Route
  * isolation is intentionally per socket; no global default route is ever
  * changed after startup.
  */
@@ -23,6 +24,7 @@ type TunnelState = "starting" | "ready" | "backoff" | "stopped";
 interface TunnelInfo {
 	configPath: string;
 	configName: string;
+	protocol: TunnelProtocol;
 	port: number;
 	devName: string;
 	routingTable: number;
@@ -30,6 +32,8 @@ interface TunnelInfo {
 	routingRulePriority: number;
 	state: TunnelState;
 	interfaceIp?: string;
+	interfaceAddress?: string;
+	mtu?: number;
 	process?: ChildProcess;
 }
 
@@ -46,6 +50,10 @@ interface OpenVpnRun {
 	exited: Promise<OpenVpnExit>;
 }
 
+interface WireGuardRun {
+	interfaceName: string;
+}
+
 class OpenVpnError extends Error {
 	readonly authFailed: boolean;
 
@@ -60,6 +68,8 @@ const ENV = process.env;
 const AUTH_FILE_PATH = ENV.OPENVPN_AUTH_FILE || "/etc/openvpn/auth.txt";
 const OVPN_CONFIG_DIR = ENV.OVPN_CONFIG_DIR || "/etc/openvpn/configs";
 const OPENVPN_BIN = ENV.OPENVPN_BIN || "openvpn";
+const WIREGUARD_BIN = ENV.WIREGUARD_BIN || "wg";
+const IP_BIN = ENV.IP_BIN || "ip";
 const BASE_PORT = integerFromEnv("BASE_PROXY_PORT", 8100);
 const MAX_CONNECTIONS = integerFromEnv("MAX_CONNECTIONS", 0);
 const PORT_GAP = integerFromEnv("PORT_GAP", 1);
@@ -69,6 +79,7 @@ const TUN_IP_WAIT_MS = integerFromEnv("TUN_IP_WAIT_MS", 30_000);
 const STARTUP_TIMEOUT_MS = integerFromEnv("STARTUP_TIMEOUT_MS", 120_000);
 const RESTART_INITIAL_DELAY_MS = integerFromEnv("RESTART_INITIAL_DELAY_MS", 1_000);
 const RESTART_MAX_DELAY_MS = integerFromEnv("RESTART_MAX_DELAY_MS", 30_000);
+const WIREGUARD_HEALTH_CHECK_INTERVAL_MS = integerFromEnv("WIREGUARD_HEALTH_CHECK_INTERVAL_MS", 5_000);
 const ROUTING_TABLE_BASE = integerFromEnv("ROUTING_TABLE_BASE", 10_000);
 const ROUTING_MARK_BASE = integerFromEnv("ROUTING_MARK_BASE", 0x5a0000);
 const ROUTING_RULE_PRIORITY_BASE = integerFromEnv("ROUTING_RULE_PRIORITY_BASE", 12_000);
@@ -83,6 +94,7 @@ const shutdownSignal = new Promise<void>((resolve) => {
 });
 const proxyServers = new Set<net.Server>();
 const activeOpenVpn = new Set<ChildProcess>();
+const activeWireGuard = new Set<string>();
 let credentialRefresh: Promise<void> | undefined;
 
 function integerFromEnv(name: string, fallback: number): number {
@@ -125,6 +137,7 @@ function validateRuntimeOptions(): void {
 		["STARTUP_TIMEOUT_MS", STARTUP_TIMEOUT_MS],
 		["RESTART_INITIAL_DELAY_MS", RESTART_INITIAL_DELAY_MS],
 		["RESTART_MAX_DELAY_MS", RESTART_MAX_DELAY_MS],
+		["WIREGUARD_HEALTH_CHECK_INTERVAL_MS", WIREGUARD_HEALTH_CHECK_INTERVAL_MS],
 	] as const) {
 		if (!Number.isSafeInteger(value) || value < 1) {
 			throw new Error(`${name} must be a positive integer (received ${value})`);
@@ -211,36 +224,36 @@ async function refreshCredentialsIfUnchanged(snapshot: OpenVpnCredentials): Prom
 	await credentialRefresh;
 }
 
-async function listConfigs(): Promise<string[]> {
-	const entries = await fs.readdir(OVPN_CONFIG_DIR).catch(() => [] as string[]);
-	const configs = entries
-		.filter((entry) => entry.toLowerCase().endsWith(".ovpn"))
-		.sort((left, right) => left.localeCompare(right))
-		.map((entry) => path.join(OVPN_CONFIG_DIR, entry));
-	if (!configs.length) throw new Error(`No .ovpn configurations found in ${OVPN_CONFIG_DIR}`);
-	return configs;
+async function listConfigs(): Promise<TunnelProfile[]> {
+	return listTunnelProfiles(OVPN_CONFIG_DIR);
 }
 
-function buildTunnels(configs: string[]): TunnelInfo[] {
+function buildTunnels(configs: TunnelProfile[]): TunnelInfo[] {
 	const selected = MAX_CONNECTIONS === 0 ? configs : configs.slice(0, MAX_CONNECTIONS);
-	if (!selected.length) throw new Error("MAX_CONNECTIONS selected zero OpenVPN profiles");
-	return selected.map((configPath, index) => {
+	if (!selected.length) throw new Error("MAX_CONNECTIONS selected zero tunnel profiles");
+	let openVpnIndex = 0;
+	let wireGuardIndex = 0;
+	return selected.map((config, index) => {
 		const port = BASE_PORT + PORT_GAP * (index + 1);
 		const routingTable = ROUTING_TABLE_BASE + index;
 		const routingMark = ROUTING_MARK_BASE + index;
 		const routingRulePriority = ROUTING_RULE_PRIORITY_BASE + index;
 		if (port > 65535 || routingTable > 0xffffffff || routingMark > 0xffffffff || routingRulePriority > 0xffffffff) {
-			throw new Error("Too many OpenVPN profiles for the configured port or routing identifier ranges");
+			throw new Error("Too many tunnel profiles for the configured port or routing identifier ranges");
 		}
 		return {
-			configPath,
-			configName: path.basename(configPath),
+			configPath: config.configPath,
+			configName: config.configName,
+			protocol: config.protocol,
 			port,
-			devName: `tun${index}`,
+			devName: config.protocol === "wireguard" ? `wg${wireGuardIndex++}` : `tun${openVpnIndex++}`,
 			routingTable,
 			routingMark,
 			routingRulePriority,
 			state: "starting",
+			interfaceIp: config.interfaceIp,
+			interfaceAddress: config.interfaceAddress,
+			mtu: config.mtu,
 		};
 	});
 }
@@ -258,7 +271,7 @@ function parseIPv4(value: string): string | undefined {
 
 function tunnelIpv4(device: string): string | undefined {
 	try {
-		const result = spawnSync("ip", ["-j", "-4", "address", "show", "dev", device], {
+		const result = spawnSync(IP_BIN, ["-j", "-4", "address", "show", "dev", device], {
 			encoding: "utf8",
 			stdio: ["ignore", "pipe", "ignore"],
 		});
@@ -270,7 +283,7 @@ function tunnelIpv4(device: string): string | undefined {
 		// Fall through to text parsing for older iproute2 versions.
 	}
 	try {
-		const result = spawnSync("ip", ["-4", "-o", "address", "show", "dev", device], {
+		const result = spawnSync(IP_BIN, ["-4", "-o", "address", "show", "dev", device], {
 			encoding: "utf8",
 			stdio: ["ignore", "pipe", "ignore"],
 		});
@@ -281,6 +294,11 @@ function tunnelIpv4(device: string): string | undefined {
 }
 
 async function waitForTunnelIpv4(tunnel: TunnelInfo): Promise<void> {
+	if (tunnel.protocol === "wireguard") {
+		tunnel.interfaceIp = tunnelIpv4(tunnel.devName) || tunnel.interfaceIp;
+		if (REQUIRE_TUN_IP && !tunnel.interfaceIp) throw new OpenVpnError(`No IPv4 address appeared on ${tunnel.devName}`);
+		return;
+	}
 	const deadline = Date.now() + TUN_IP_WAIT_MS;
 	while (!stopping) {
 		const address = tunnelIpv4(tunnel.devName) || tunnel.interfaceIp;
@@ -295,10 +313,121 @@ async function waitForTunnelIpv4(tunnel: TunnelInfo): Promise<void> {
 }
 
 function runIp(arguments_: string[], description: string, allowFailure = false): void {
-	const result = spawnSync("ip", arguments_, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+	const result = spawnSync(IP_BIN, arguments_, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
 	if (result.status === 0 || allowFailure) return;
 	const output = `${result.stdout || ""}\n${result.stderr || ""}`.trim();
-	throw new Error(`${description} failed${output ? `: ${output}` : ""}`);
+	const spawnError = result.error instanceof Error ? `: ${result.error.message}` : "";
+	throw new Error(`${description} failed${output ? `: ${output}` : spawnError}`);
+}
+
+function runWireGuard(arguments_: string[], description: string, allowFailure = false): string {
+	const result = spawnSync(WIREGUARD_BIN, arguments_, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+	if (result.status === 0) return result.stdout || "";
+	if (allowFailure) return result.stdout || "";
+	const output = `${result.stdout || ""}\n${result.stderr || ""}`.trim();
+	const spawnError = result.error instanceof Error ? `: ${result.error.message}` : "";
+	throw new Error(`${description} failed${output ? `: ${output}` : spawnError}`);
+}
+
+function wireGuardInterfaceExists(device: string): boolean {
+	const result = spawnSync(IP_BIN, ["link", "show", "dev", device], {
+		encoding: "utf8",
+		stdio: ["ignore", "pipe", "ignore"],
+	});
+	return result.status === 0;
+}
+
+function wireGuardInterfaceIsKernelDevice(device: string): boolean {
+	const result = spawnSync(IP_BIN, ["-d", "link", "show", "dev", device], {
+		encoding: "utf8",
+		stdio: ["ignore", "pipe", "ignore"],
+	});
+	return result.status === 0 && /\bwireguard\b/i.test(result.stdout || "");
+}
+
+function wireGuardConfigured(device: string): boolean {
+	const result = spawnSync(WIREGUARD_BIN, ["show", "interfaces"], {
+		encoding: "utf8",
+		stdio: ["ignore", "pipe", "ignore"],
+	});
+	if (result.status !== 0) return false;
+	return (result.stdout || "").split(/\s+/).includes(device);
+}
+
+function ensureWireGuardBinary(): void {
+	const result = spawnSync(WIREGUARD_BIN, ["--version"], {
+		encoding: "utf8",
+		stdio: ["ignore", "pipe", "pipe"],
+	});
+	if (result.status !== 0) {
+		const detail = result.error instanceof Error ? `: ${result.error.message}` : "";
+		throw new Error(`WireGuard profiles require the '${WIREGUARD_BIN}' binary (install wireguard-tools)${detail}`);
+	}
+}
+
+function removeWireGuardInterface(device: string): void {
+	// `ip link del` also removes addresses and the kernel WireGuard UDP socket.
+	// It is intentionally idempotent so failed partial startups and shutdowns
+	// cannot leave a stale interface that receives a later tunnel's traffic.
+	if (!wireGuardInterfaceExists(device)) {
+		activeWireGuard.delete(device);
+		return;
+	}
+	if (!wireGuardInterfaceIsKernelDevice(device)) {
+		console.warn(`[wireguard] refusing to remove non-WireGuard interface ${device}`);
+		return;
+	}
+	runIp(["link", "del", "dev", device], `remove ${device} WireGuard interface`, true);
+	activeWireGuard.delete(device);
+}
+
+async function startWireGuard(tunnel: TunnelInfo): Promise<WireGuardRun> {
+	const source = await fs.readFile(tunnel.configPath, "utf8");
+	const stripped = stripWireGuardConfig(source);
+	if (!stripped.includes("[Interface]")) throw new Error(`WireGuard profile ${tunnel.configName} has no [Interface] section`);
+	if (!stripped.includes("[Peer]")) throw new Error(`WireGuard profile ${tunnel.configName} has no [Peer] section`);
+
+	removeWireGuardInterface(tunnel.devName);
+	// Never carry an address from a previous interface generation into a new
+	// route. The address below is re-read from the freshly created device.
+	tunnel.interfaceIp = undefined;
+	runIp(["link", "add", "dev", tunnel.devName, "type", "wireguard"], `create ${tunnel.devName} WireGuard interface`);
+	activeWireGuard.add(tunnel.devName);
+	const temporaryPath = `/run/proton-proxy-${process.pid}-${tunnel.devName}-${Date.now()}.conf`;
+	try {
+		await fs.writeFile(temporaryPath, stripped, { mode: 0o600 });
+		await fs.chmod(temporaryPath, 0o600);
+		runWireGuard(["setconf", tunnel.devName, temporaryPath], `configure ${tunnel.devName} WireGuard peer`);
+		// Keep the host's main route for encrypted UDP transport. Application
+		// sockets use routingMark and the private table installed below; leaving
+		// the WireGuard interface fwmark at zero prevents recursive endpoint
+		// routing when several full-tunnel interfaces coexist.
+		runWireGuard(["set", tunnel.devName, "fwmark", "0"], `clear ${tunnel.devName} WireGuard transport mark`);
+		if (tunnel.interfaceAddress) {
+			runIp(["-4", "address", "replace", tunnel.interfaceAddress, "dev", tunnel.devName], `assign ${tunnel.devName} IPv4 address`);
+		}
+		if (tunnel.mtu) runIp(["link", "set", "dev", tunnel.devName, "mtu", String(tunnel.mtu)], `set ${tunnel.devName} MTU`);
+		runIp(["link", "set", "dev", tunnel.devName, "up"], `activate ${tunnel.devName} WireGuard interface`);
+		tunnel.interfaceIp = tunnelIpv4(tunnel.devName);
+		if (REQUIRE_TUN_IP && !tunnel.interfaceIp) throw new Error(`No IPv4 address appeared on ${tunnel.devName}`);
+		console.log(`[wireguard] launched ${tunnel.configName} on ${tunnel.devName}`);
+		return { interfaceName: tunnel.devName };
+	} catch (error) {
+		removeWireGuardInterface(tunnel.devName);
+		throw error;
+	} finally {
+		await fs.rm(temporaryPath, { force: true }).catch(() => undefined);
+	}
+}
+
+async function waitForWireGuardFailure(tunnel: TunnelInfo): Promise<void> {
+	while (!stopping) {
+		await waitOrShutdown(WIREGUARD_HEALTH_CHECK_INTERVAL_MS);
+		if (stopping) return;
+		if (!wireGuardInterfaceExists(tunnel.devName) || !wireGuardConfigured(tunnel.devName)) {
+			throw new Error(`WireGuard interface ${tunnel.devName} disappeared or lost its peer configuration`);
+		}
+	}
 }
 
 function clearTunnelRoute(tunnel: TunnelInfo): void {
@@ -499,12 +628,17 @@ async function superviseTunnel(tunnel: TunnelInfo): Promise<void> {
 	let retryDelay = Math.max(100, RESTART_INITIAL_DELAY_MS);
 	while (!stopping) {
 		tunnel.state = "starting";
-		tunnel.interfaceIp = undefined;
-		const credentialSnapshot = readAuth();
+		if (tunnel.protocol === "openvpn") tunnel.interfaceIp = undefined;
+		const credentialSnapshot = tunnel.protocol === "openvpn" ? readAuth() : undefined;
 		let run: OpenVpnRun | undefined;
+		let wireGuardRun: WireGuardRun | undefined;
 		try {
-			run = startOpenVpn(tunnel);
-			await run.ready;
+			if (tunnel.protocol === "openvpn") {
+				run = startOpenVpn(tunnel);
+				await run.ready;
+			} else {
+				wireGuardRun = await startWireGuard(tunnel);
+			}
 			await waitForTunnelIpv4(tunnel);
 			configureTunnelRoute(tunnel);
 			if (stopping) break;
@@ -512,11 +646,15 @@ async function superviseTunnel(tunnel: TunnelInfo): Promise<void> {
 			retryDelay = Math.max(100, RESTART_INITIAL_DELAY_MS);
 			console.log(`[tunnel] ready ${tunnel.configName}: ${tunnel.devName} (${tunnel.interfaceIp || "no IPv4"})`);
 
-			const exited = await run.exited;
-			if (!stopping && exited.authFailed) await refreshCredentialsIfUnchanged(credentialSnapshot);
+			if (run) {
+				const exited = await run.exited;
+				if (!stopping && exited.authFailed && credentialSnapshot) await refreshCredentialsIfUnchanged(credentialSnapshot);
+			} else {
+				await waitForWireGuardFailure(tunnel);
+			}
 		} catch (error) {
 			console.error(`[tunnel] ${tunnel.configName} failed: ${error instanceof Error ? error.message : String(error)}`);
-			if (error instanceof OpenVpnError && error.authFailed && !stopping) {
+			if (error instanceof OpenVpnError && error.authFailed && credentialSnapshot && !stopping) {
 				try {
 					await refreshCredentialsIfUnchanged(credentialSnapshot);
 				} catch (refreshError) {
@@ -527,6 +665,7 @@ async function superviseTunnel(tunnel: TunnelInfo): Promise<void> {
 			tunnel.state = stopping ? "stopped" : "backoff";
 			clearTunnelRoute(tunnel);
 			if (run) await stopOpenVpn(run.child);
+			if (wireGuardRun) removeWireGuardInterface(wireGuardRun.interfaceName);
 		}
 		if (stopping) break;
 		console.warn(`[tunnel] retrying ${tunnel.configName} in ${retryDelay}ms`);
@@ -721,7 +860,7 @@ async function waitForReadyTunnel(tunnels: TunnelInfo[]): Promise<void> {
 		await waitOrShutdown(250);
 	}
 	if (!tunnels.some(tunnelReady)) {
-		throw new Error(`No OpenVPN tunnel became ready within ${STARTUP_TIMEOUT_MS}ms (${tunnels.map((tunnel) => `${tunnel.configName}:${tunnel.state}`).join(", ")})`);
+		throw new Error(`No VPN tunnel became ready within ${STARTUP_TIMEOUT_MS}ms (${tunnels.map((tunnel) => `${tunnel.configName}:${tunnel.state}`).join(", ")})`);
 	}
 }
 
@@ -738,23 +877,29 @@ async function shutdown(tunnels: TunnelInfo[]): Promise<void> {
 	}
 	for (const tunnel of tunnels) clearTunnelRoute(tunnel);
 	await Promise.all([...activeOpenVpn].map((child) => stopOpenVpn(child)));
+	for (const tunnel of tunnels) {
+		if (tunnel.protocol === "wireguard") removeWireGuardInterface(tunnel.devName);
+	}
 }
 
 async function main(): Promise<void> {
 	validateRuntimeOptions();
 	await ensureTunDevice();
-	await ensureInitialAuth();
 	await overrideDns();
 
 	const tunnels = buildTunnels(await listConfigs());
 	signalTunnels = tunnels;
+	if (tunnels.some((tunnel) => tunnel.protocol === "wireguard")) ensureWireGuardBinary();
+	if (tunnels.some((tunnel) => tunnel.protocol === "openvpn")) await ensureInitialAuth();
 	let workers: Promise<void>[] = [];
 	try {
 		await createRotatingProxy(tunnels);
 		await Promise.all(tunnels.map(createTunnelProxy));
 		workers = tunnels.map((tunnel) => superviseTunnel(tunnel));
 		await waitForReadyTunnel(tunnels);
-		console.log(`[service] ready: ${tunnels.length} concurrent OpenVPN tunnel worker(s), rotating proxy on ${BASE_PORT}`);
+		const openVpnCount = tunnels.filter((tunnel) => tunnel.protocol === "openvpn").length;
+		const wireGuardCount = tunnels.length - openVpnCount;
+		console.log(`[service] ready: ${tunnels.length} concurrent VPN tunnel worker(s) (${openVpnCount} OpenVPN, ${wireGuardCount} WireGuard), rotating proxy on ${BASE_PORT}`);
 		await Promise.all(workers);
 	} finally {
 		await shutdown(tunnels);
