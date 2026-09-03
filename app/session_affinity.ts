@@ -7,6 +7,14 @@ const BASIC_HEADER = /^\s*proxy-authorization\s*:\s*basic\s+([^\s]+)\s*$/im;
 const BASE64_TOKEN = /^[A-Za-z0-9+/]+={0,2}$/;
 const SESSION_TOKEN = /^[a-f0-9]{64}$/i;
 
+/** Remove hop-by-hop proxy credentials before forwarding an absolute request. */
+export function stripProxyAuthorizationHeaders(headerText: string): string {
+	return headerText
+		.split("\r\n")
+		.filter((line, index) => index === 0 || !/^\s*proxy-authorization\s*:/i.test(line))
+		.join("\r\n");
+}
+
 /**
  * Extract the opaque session token from an HTTP CONNECT header block.
  *

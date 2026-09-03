@@ -5,6 +5,7 @@ import {
 	PROTON_SESSION_USERNAME,
 	parseProtonSessionToken,
 	rendezvousIndex,
+	stripProxyAuthorizationHeaders,
 } from "./session_affinity.ts";
 
 function basic(value: string): string {
@@ -37,6 +38,21 @@ test("parses only the reserved opaque Proton session credential", () => {
 		),
 		undefined,
 	);
+});
+
+test("removes proxy credentials before an absolute HTTP request is forwarded", () => {
+	const request = [
+		"GET http://example.test/ HTTP/1.1",
+		"Host: example.test",
+		`Proxy-Authorization: Basic ${basic(`${PROTON_SESSION_USERNAME}:${"a".repeat(64)}`)}`,
+		"Proxy-Authorization: Basic should-not-reach-the-origin",
+		"Accept: */*",
+	].join("\r\n");
+	const forwarded = stripProxyAuthorizationHeaders(request);
+	assert.match(forwarded, /^GET http:\/\/example\.test\/ HTTP\/1\.1/m);
+	assert.match(forwarded, /Host: example\.test/);
+	assert.match(forwarded, /Accept: \*\/\*/);
+	assert.doesNotMatch(forwarded, /proxy-authorization/i);
 });
 
 test("session selection is stable and remaps only when its selected candidate disappears", () => {

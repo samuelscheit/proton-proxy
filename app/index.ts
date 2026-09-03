@@ -1,5 +1,9 @@
 import { spawn, spawnSync, type ChildProcess } from "child_process";
-import { parseProtonSessionToken, rendezvousIndex } from "./session_affinity.ts";
+import {
+	parseProtonSessionToken,
+	rendezvousIndex,
+	stripProxyAuthorizationHeaders,
+} from "./session_affinity.ts";
 import { existsSync, promises as fs, readFileSync } from "fs";
 import dns from "dns";
 import net from "net";
@@ -842,7 +846,11 @@ async function handleProxyRequest(
 				const url = new URL(requestMatch[1]);
 				if (url.protocol === "http:") {
 					target = { host: url.hostname, port: url.port ? Number.parseInt(url.port, 10) : 80 };
-					initialData = firstChunk;
+					initialData = Buffer.concat([
+						Buffer.from(stripProxyAuthorizationHeaders(headerText), "latin1"),
+						Buffer.from("\r\n\r\n", "ascii"),
+						Buffer.from(rest),
+					]);
 				}
 			} catch {
 				// Invalid absolute HTTP URL below falls through to a closed socket.
